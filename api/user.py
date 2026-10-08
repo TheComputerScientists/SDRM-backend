@@ -9,14 +9,17 @@ from datetime import datetime, timedelta
 from __init__ import app, db
 from api.authorize import token_required
 from model.user import User
-from model.github import GitHubUser
 import os
+import re
 
 user_api = Blueprint('user_api', __name__,
                    url_prefix='/api')
 
 # API docs https://flask-restful.readthedocs.io/en/latest/api.html
 api = Api(user_api)
+
+# Allowed User IDs: 2-40 letters, numbers, dots, dashes or underscores (no GitHub account needed)
+UID_PATTERN = re.compile(r'[A-Za-z0-9._-]{2,40}')
 
 # Tokens this process has already spent, so a captured token can't be replayed against
 # Flask again within its own TTL -- Spring enforces single-use on its side too (consumed
@@ -170,15 +173,12 @@ class UserAPI:
             if name is None or len(name) < 2:
                 return {'message': f'Name is missing, or is less than 2 characters'}, 400
             
-            # validate uid
+            # validate uid (any username; it no longer has to be a GitHub account)
             uid = body.get('uid')
             if uid is None or len(uid) < 2:
                 return {'message': f'User ID is missing, or is less than 2 characters'}, 400
-          
-            # check if uid is a GitHub account
-            _, status = GitHubUser().get(uid)
-            if status != 200:
-                return {'message': f'User ID {uid} not a valid GitHub account' }, 404
+            if not UID_PATTERN.fullmatch(uid):
+                return {'message': 'User ID can only use letters, numbers, dots, dashes and underscores (up to 40 characters)'}, 400
             
             ''' User object creation '''
             #1: Setup minimal User object using __init__ method
@@ -333,11 +333,10 @@ class UserAPI:
                 # Non-admin can only update themselves
                 user = current_user
                 
-            # Accounts are desired to be GitHub accounts, change must be validated 
+            # A new User ID only has to match the username format (no GitHub account needed)
             if body.get('uid') and body.get('uid') != user._uid:
-                _, status = GitHubUser().get(body.get('uid'))
-                if status != 200:
-                    return {'message': f'User ID {body.get("uid")} not a valid GitHub account' }, 404
+                if not UID_PATTERN.fullmatch(body.get('uid')):
+                    return {'message': 'User ID can only use letters, numbers, dots, dashes and underscores (up to 40 characters)'}, 400
             
             # Update the User object to the database using custom update method
             user.update(body)
