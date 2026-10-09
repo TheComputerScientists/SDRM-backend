@@ -20,6 +20,23 @@ api = Api(user_api)
 
 # Allowed User IDs: 2-40 letters, numbers, dots, dashes or underscores (no GitHub account needed)
 UID_PATTERN = re.compile(r'[A-Za-z0-9._-]{2,40}')
+EMAIL_PATTERN = re.compile(r'[^\s@]+@[^\s@]+\.[^\s@]+')
+
+def _find_users_by_email(email):
+    """Users registered with this email, ignoring letter case."""
+    return User.query.filter(db.func.lower(User._email) == email.strip().lower()).all()
+
+def _uid_from_email(email):
+    """Make an unused User ID from the part of the email before the @, for sign-ups
+    that don't send one. People log in with their email, so they never need to know it."""
+    base = re.sub(r'[^A-Za-z0-9._-]', '', email.split('@')[0])[:30]
+    if len(base) < 2:
+        base = 'user'
+    uid, count = base, 1
+    while User.query.filter_by(_uid=uid).first():
+        count += 1
+        uid = f'{base}{count}'
+    return uid
 
 # Tokens this process has already spent, so a captured token can't be replayed against
 # Flask again within its own TTL -- Spring enforces single-use on its side too (consumed
@@ -175,6 +192,15 @@ class UserAPI:
             
             # validate uid (any username; it no longer has to be a GitHub account)
             uid = body.get('uid')
+            if not uid:
+                # No User ID sent: the account is identified by its email instead
+                email = (body.get('email') or '').strip().lower()
+                if not EMAIL_PATTERN.fullmatch(email):
+                    return {'message': 'Email is missing, or is not a valid email address'}, 400
+                if _find_users_by_email(email):
+                    return {'message': 'Email is already registered'}, 409
+                body['email'] = email
+                uid = _uid_from_email(email)
             if uid is None or len(uid) < 2:
                 return {'message': f'User ID is missing, or is less than 2 characters'}, 400
             if not UID_PATTERN.fullmatch(uid):
@@ -453,19 +479,29 @@ class UserAPI:
                     }, 400
                 ''' Get Data '''
                 uid = body.get('uid')
-                if uid is None:
-                    return {'message': f'User ID is missing'}, 401
+                email = body.get('email')
+                if not uid and not email:
+                    return {'message': f'Email or User ID is missing'}, 401
+                if not uid and not EMAIL_PATTERN.fullmatch(email.strip()):
+                    # also keeps the "?" placeholder email of older accounts from matching
+                    return {'message': f"Invalid email, user id or password"}, 401
                 password = body.get('password')
                 if not password:
                     return {'message': f'Password is missing'}, 401
                             
-                ''' Find user '''
+                ''' Find user, by User ID or by email '''
     
-                user = User.query.filter_by(_uid=uid).first()
+                if uid:
+                    user = User.query.filter_by(_uid=uid).first()
+                    if user is not None and not user.is_password(password):
+                        user = None
+                else:
+                    # Older accounts may share an email, so take the one this password fits
+                    user = next((u for u in _find_users_by_email(email) if u.is_password(password)), None)
                 
-                if user is None or not user.is_password(password):
+                if user is None:
                     
-                    return {'message': f"Invalid user id or password"}, 401
+                    return {'message': f"Invalid email, user id or password"}, 401
                             
                 # Check if user is found
                 if user:
