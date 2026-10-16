@@ -39,7 +39,7 @@ def normalize_role(role):
         return None
     return next((r for r in ROLES if r.lower() == role.strip().lower()), None)
 
-# Sign-up limits (the SDRM site reads these from /api/sdrm/content to validate forms)
+# Sign-up limits (the SDRM frontend checks the same numbers in assets/js/sdrm/auth.js and login.js)
 NAME_MIN = 2
 PASSWORD_MIN = 8
 

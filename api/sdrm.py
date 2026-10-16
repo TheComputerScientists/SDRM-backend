@@ -1,9 +1,8 @@
-""" Public data API for the SDRM volunteer site (model/sdrm.py).
+""" Volunteer shifts API for the SDRM volunteer site (model/sdrm.py).
 
-  GET    /api/sdrm/content                      every page's text, links and lists, plus form limits
-  GET    /api/sdrm/resources                    needs, locations and help resources
-  GET    /api/sdrm/rates                        cost of a meal and a night of shelter
-  GET    /api/sdrm/stats                        home page stat band
+Page text, help resources, gift rates and home stats are static JSON in the frontend;
+only data shared between users lives here.
+
   GET    /api/sdrm/opportunities                days, interests and shifts with spots left
                                                 (plus signedUp when logged in)
   POST   /api/sdrm/opportunities/<id>/signup    take a spot   (login required)
@@ -16,9 +15,7 @@ from sqlalchemy.exc import IntegrityError
 
 from __init__ import db
 from api.authorize import auth_required, optional_user
-from model.sdrm import (DAYS, GIFT_MAX, SdrmContent, SdrmInterest, SdrmLocation, SdrmNeed, SdrmOpportunity, SdrmRates, SdrmResource,
-                        SdrmSignup, SdrmStat)
-from model.user import GUARDIAN_EMAIL_MAX, GUARDIAN_NAME_MAX, NAME_MIN, PASSWORD_MIN
+from model.sdrm import DAYS, SdrmInterest, SdrmOpportunity, SdrmSignup
 
 sdrm_api = Blueprint('sdrm_api', __name__, url_prefix='/api/sdrm')
 api = Api(sdrm_api)
@@ -39,39 +36,6 @@ def _read_opportunity(opportunity, user_id):
 
 
 class SdrmAPI:
-    class _Content(Resource):
-        def get(self):
-            return {
-                'content': {c.key: c.read() for c in SdrmContent.query},
-                # The same numbers the backend validates with, so the forms can check first
-                'limits': {
-                    'nameMin': NAME_MIN,
-                    'passwordMin': PASSWORD_MIN,
-                    'guardianNameMax': GUARDIAN_NAME_MAX,
-                    'guardianEmailMax': GUARDIAN_EMAIL_MAX,
-                    'giftMax': GIFT_MAX,
-                },
-            }
-
-    class _Resources(Resource):
-        def get(self):
-            return {
-                'needs': [n.read() for n in SdrmNeed.query.order_by(SdrmNeed.position)],
-                'locations': [l.read() for l in SdrmLocation.query.order_by(SdrmLocation.position)],
-                'resources': [r.read() for r in SdrmResource.query.order_by(SdrmResource.position)],
-            }
-
-    class _Rates(Resource):
-        def get(self):
-            rates = SdrmRates.query.order_by(SdrmRates.id).first()
-            if rates is None:
-                return {'message': 'No rates have been set'}, 404
-            return rates.read()
-
-    class _Stats(Resource):
-        def get(self):
-            return {'stats': [s.read() for s in SdrmStat.query.order_by(SdrmStat.position)]}
-
     class _Opportunities(Resource):
         def get(self):
             user = optional_user()
@@ -124,9 +88,5 @@ class SdrmAPI:
             db.session.commit()
             return _read_opportunity(opportunity, user.id)
 
-    api.add_resource(_Content, '/content')
-    api.add_resource(_Resources, '/resources')
-    api.add_resource(_Rates, '/rates')
-    api.add_resource(_Stats, '/stats')
     api.add_resource(_Opportunities, '/opportunities')
     api.add_resource(_Signup, '/opportunities/<string:opportunity_id>/signup')

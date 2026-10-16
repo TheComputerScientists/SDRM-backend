@@ -34,7 +34,7 @@ from api.congrats_api import congrats_api  # Import the congrats API
 from api.profile_game import profile_game_api  # CS Pathway Game profile persistence
 from api.snapshot_proxy import snapshot_proxy
 from api.coordinator import coordinator_api  # SDRM coordinator-only routes
-from api.sdrm import sdrm_api  # SDRM site data (resources, rates, stats, volunteer shifts)
+from api.sdrm import sdrm_api  # SDRM volunteer shifts and sign-ups
 #from api.announcement import announcement_api ##temporary revert
 
 # database Initialization functions
@@ -98,7 +98,7 @@ app.register_blueprint(congrats_api)  # Register the congrats message API
 app.register_blueprint(profile_game_api)  # CS Pathway Game profile persistence
 app.register_blueprint(snapshot_proxy)  # Register the snapshot proxy API
 app.register_blueprint(coordinator_api)  # SDRM coordinator-only routes
-app.register_blueprint(sdrm_api)  # SDRM site data
+app.register_blueprint(sdrm_api)  # SDRM volunteer shifts and sign-ups
 # app.register_blueprint(announcement_api) ##temporary revert
 
 # Jokes file initialization
