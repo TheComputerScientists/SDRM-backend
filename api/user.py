@@ -8,7 +8,7 @@ from flask_restful import Api, Resource # used for REST API building
 from datetime import datetime, timedelta
 from __init__ import app, db
 from api.authorize import token_required, role_required
-from model.user import User, normalize_role, GUARDIAN_NAME_MAX, GUARDIAN_EMAIL_MAX
+from model.user import User, normalize_role, NAME_MIN, PASSWORD_MIN, GUARDIAN_NAME_MAX, GUARDIAN_EMAIL_MAX
 import os
 import re
 
@@ -128,8 +128,8 @@ def _guardian_fields(body, user=None):
     if 'guardian_email' in fields:
         email = fields['guardian_email'] = email.lower()
 
-    if name and not 2 <= len(name) <= GUARDIAN_NAME_MAX:
-        return None, f'Guardian name must be 2 to {GUARDIAN_NAME_MAX} characters'
+    if name and not NAME_MIN <= len(name) <= GUARDIAN_NAME_MAX:
+        return None, f'Guardian name must be {NAME_MIN} to {GUARDIAN_NAME_MAX} characters'
     if email and (len(email) > GUARDIAN_EMAIL_MAX or not EMAIL_PATTERN.fullmatch(email)):
         return None, 'Guardian email is not a valid email address'
     if name and not email:
@@ -223,8 +223,8 @@ class UserAPI:
             ''' Avoid garbage in, error checking '''
             # validate name
             name = body.get('name')
-            if name is None or len(name) < 2:
-                return {'message': f'Name is missing, or is less than 2 characters'}, 400
+            if name is None or len(name) < NAME_MIN:
+                return {'message': f'Name is missing, or is less than {NAME_MIN} characters'}, 400
             
             # validate uid (any username; it no longer has to be a GitHub account)
             uid = body.get('uid')
@@ -246,8 +246,8 @@ class UserAPI:
             #1: Setup minimal User object using __init__ method
             password = body.get('password')
             if password is not None:
-                if len(password) < 8 and not password.startswith("pbkdf2:sha256:"):
-                    return {'message': 'Password must be at least 8 characters'}, 400
+                if len(password) < PASSWORD_MIN and not password.startswith("pbkdf2:sha256:"):
+                    return {'message': f'Password must be at least {PASSWORD_MIN} characters'}, 400
                 user_obj = User(name=name, uid=uid, password=password)
             else:
                 user_obj = User(name=name, uid=uid)
@@ -918,8 +918,8 @@ class UserAPI:
 
             if not uid or not reset_token or not password:
                 return {'message': 'uid, resetToken, and newPassword are required'}, 400
-            if len(password) < 8:
-                return {'message': 'Password must be at least 8 characters'}, 400
+            if len(password) < PASSWORD_MIN:
+                return {'message': f'Password must be at least {PASSWORD_MIN} characters'}, 400
             if not _consume_reset_token(uid, reset_token):
                 return {'message': 'Invalid, expired, or already-used reset token'}, 403
 

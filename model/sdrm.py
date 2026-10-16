@@ -1,10 +1,11 @@
-""" Data for the SDRM volunteer site: help resources, gift rates, home page stats,
-volunteer shifts and the sign-ups for them.
+""" Data for the SDRM volunteer site: the text of every page, help resources, gift
+rates, home page stats, volunteer shifts and the sign-ups for them.
 
 The frontend has no data of its own; every page reads these tables through api/sdrm.py.
 init_sdrm() creates the tables if they're missing and fills empty ones with the
 placeholder rows below (all marked "TODO: verify", none of them real figures).
 """
+import json
 from datetime import datetime
 
 from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Table, Text, UniqueConstraint
@@ -14,6 +15,27 @@ from __init__ import app, db
 from model.user import User
 
 DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+# Largest amount the Ways to Give calculator accepts, in dollars
+GIFT_MAX = 1000000
+
+
+""" Page text """
+
+class SdrmContent(db.Model):
+    """
+    One piece of site text, e.g. "give.title" -> "Ways to Give".
+
+    `value` is JSON: usually a string, or a list of objects for repeated things like
+    nav links and cards. Strings may use **bold**, *italic*, `code` and [links](/path/).
+    """
+    __tablename__ = 'sdrm_content'
+
+    key = Column(String(100), primary_key=True)
+    value = Column(Text, nullable=False)
+
+    def read(self):
+        return json.loads(self.value)
 
 
 """ Get Help Now """
@@ -172,6 +194,7 @@ class SdrmSignup(db.Model):
 
 
 SDRM_TABLES = [
+    SdrmContent.__table__,
     SdrmNeed.__table__, SdrmLocation.__table__, SdrmResource.__table__, resource_needs,
     SdrmRates.__table__, SdrmStat.__table__,
     SdrmInterest.__table__, SdrmOpportunity.__table__, SdrmSignup.__table__,
@@ -181,6 +204,190 @@ SDRM_TABLES = [
 """ Placeholder data (TODO: verify) -- NOT real San Diego Rescue Mission information """
 
 TODO = "TODO: verify"
+OFFICIAL_SITE = "https://www.sdrescue.org/"
+
+# Site-relative links ("/sdrm/give/") are resolved against the frontend's base URL.
+SEED_CONTENT = {
+    # Every page: header, footer, <title>
+    "site.name": "Help & Hope",
+    "site.tagline": "A student project",
+    "site.topbar": [
+        {"label": "Get help now", "href": "/sdrm/get-help/", "tone": "orange"},
+        {"label": "Volunteer", "href": "/sdrm/volunteer/", "tone": "blue"},
+        {"label": "Donate", "href": "/sdrm/give/", "tone": "red"},
+    ],
+    "site.nav": [
+        {"label": "Home", "href": "/"},
+        {"label": "Get Help Now", "href": "/sdrm/get-help/"},
+        {"label": "Ways to Give", "href": "/sdrm/give/"},
+        {"label": "Volunteer", "href": "/sdrm/volunteer/"},
+        {"label": "About", "href": "/sdrm/about/"},
+    ],
+    "site.footer.text": "A student-built guide to finding help, giving, and volunteering in San Diego. "
+                        "Every name, number, and shift on this site is placeholder data.",
+    "site.footer.exploreHeading": "Explore",
+    "site.footer.explore": [
+        {"label": "Home", "href": "/"},
+        {"label": "Get Help Now", "href": "/sdrm/get-help/"},
+        {"label": "About", "href": "/sdrm/about/"},
+    ],
+    "site.footer.involvedHeading": "Get involved",
+    "site.footer.involved": [
+        {"label": "Ways to Give", "href": "/sdrm/give/"},
+        {"label": "Volunteer", "href": "/sdrm/volunteer/"},
+    ],
+    "site.footer.emergencyHeading": "In an emergency",
+    "site.footer.emergency": "Call 911. For other community services in San Diego County, dial 211.",
+    "site.footer.note": f"Student project, not affiliated with San Diego Rescue Mission. Visit [sdrescue.org]({OFFICIAL_SITE}).",
+
+    # Home
+    "home.title": "Help and Hope in San Diego",
+    "home.lead": "A student-built guide to finding help, giving, and volunteering, inspired by the work of the San Diego Rescue Mission.",
+    "home.kicker": "Student project",
+    "home.hero.cta": "Find help near you",
+    "home.hero.ctaHref": "/sdrm/get-help/",
+    "home.hero.image": "/images/sdrm/placeholder-welcome.svg",
+    "home.hero.imageAlt": "Placeholder illustration of people gathered around a community table",
+    "home.tools.kicker": "Our commitment",
+    "home.tools.heading": "Three simple ways to connect",
+    "home.tools.intro": "Everyone deserves a warm meal, a safe place to sleep, and a path forward. "
+                        "Each tool below turns placeholder data into something you can explore.",
+    "home.tools.cards": [
+        {"tone": "orange", "icon": "pin", "title": "Get Help Now",
+         "text": "Filter shelter, meals, family services, and recovery programs by what you need and where you are.",
+         "link": "Find resources", "href": "/sdrm/get-help/"},
+        {"tone": "red", "icon": "heart", "title": "Ways to Give",
+         "text": "See how a one-time or monthly gift could turn into meals and nights of shelter.",
+         "link": "See your impact", "href": "/sdrm/give/"},
+        {"tone": "blue", "icon": "people", "title": "Volunteer",
+         "text": "Pick the days and interests that suit you, then claim an open spot on a shift.",
+         "link": "Find a shift", "href": "/sdrm/volunteer/"},
+    ],
+    "home.stats.kicker": "By the numbers",
+    "home.stats.heading": "What a community can do",
+    "home.stats.note": "Placeholder numbers marked “TODO: verify” in our database. They are not real figures.",
+    "home.about.image": "/images/sdrm/placeholder-volunteer.svg",
+    "home.about.imageAlt": "Placeholder illustration of a group of volunteers",
+    "home.about.kicker": "Why this site exists",
+    "home.about.heading": "Built by students, for learning",
+    "home.about.text": "This class project practices accessible, data-driven web pages for a real-world cause. "
+                       "It is not affiliated with the San Diego Rescue Mission, and every name, rate, and shift is a placeholder.",
+    "home.about.items": [
+        {"text": "Works with a keyboard, a screen reader, and a phone."},
+        {"text": "No payments, and an account only keeps what you choose to share."},
+        {"text": "All data comes from our Flask server and is marked “TODO: verify”."},
+    ],
+    "home.about.cta": "About this project",
+    "home.about.ctaHref": "/sdrm/about/",
+    "home.urgent.heading": "Need help right now?",
+    "home.urgent.text": "**In an emergency, call 911.** For other community services in San Diego County, you can dial 211.",
+    "home.urgent.buttons": [
+        {"label": "Get Help Now", "href": "/sdrm/get-help/", "tone": "orange"},
+        {"label": "Volunteer", "href": "/sdrm/volunteer/", "tone": "blue"},
+        {"label": "Ways to Give", "href": "/sdrm/give/", "tone": "red"},
+    ],
+
+    # Get Help Now
+    "getHelp.title": "Get Help Now",
+    "getHelp.lead": "Choose what you need and where you are. The list updates as soon as you change a filter.",
+    "getHelp.kicker": "Find support",
+    "getHelp.filters.heading": "Filter resources",
+    "getHelp.results.kicker": "Results",
+    "getHelp.results.heading": "Matching resources",
+    "getHelp.note": "**Placeholder data.** Program names and areas are examples written for a class project. "
+                    "Details marked “TODO: verify” have not been confirmed. For real, current services, "
+                    f"visit [sdrescue.org]({OFFICIAL_SITE}). In an emergency, call 911.",
+
+    # Ways to Give
+    "give.title": "Ways to Give",
+    "give.lead": "Enter an amount to see what it could provide. This is a learning tool only; no payment is collected here.",
+    "give.kicker": "Make an impact",
+    "give.calc.heading": "Gift impact calculator",
+    "give.calc.image": "/images/sdrm/placeholder-give.svg",
+    "give.calc.imageAlt": "Placeholder illustration of a shared meal",
+    "give.rates.kicker": "The math",
+    "give.rates.heading": "How the numbers are calculated",
+    "give.rates.caption": "Placeholder conversion rates",
+    "give.rates.itemHeading": "Item",
+    "give.rates.costHeading": "Placeholder cost",
+    "give.rates.meal": "One meal",
+    "give.rates.night": "One night of shelter",
+    "give.rates.note": "These rates are placeholders marked “TODO: verify” in our database. They are not official figures. "
+                       "Results are rounded down and show meals *or* nights, not both.",
+    "give.other.kicker": "More than money",
+    "give.other.heading": "Other ways to help",
+    "give.other.cards": [
+        {"title": "Donate items",
+         "text": "Many shelters accept new socks, hygiene items, and gently used clothing. Check the official site for the current wish list."},
+        {"title": "Host a drive", "text": "Organize a food or supply drive at school, work, or with friends."},
+        {"title": "Spread the word",
+         "text": "Share where people can find help. A single conversation can connect someone to a meal or a bed."},
+    ],
+    "give.other.cta": "Give on the official site",
+    "give.other.ctaHref": OFFICIAL_SITE,
+
+    # Volunteer
+    "volunteer.title": "Volunteer",
+    "volunteer.lead": "Pick the days you're free and what you enjoy. Leave a group empty to include every option.",
+    "volunteer.kicker": "Give your time",
+    "volunteer.filters.heading": "Find a shift",
+    "volunteer.results.kicker": "Open shifts",
+    "volunteer.results.heading": "Matching opportunities",
+    "volunteer.note": "**Demo only.** Shifts and spot counts are placeholders marked “TODO: verify”. Signing up saves the shift "
+                      "to your account on our server so you can cancel it any time, but it does not reserve a real shift. "
+                      f"To volunteer for real, visit [sdrescue.org]({OFFICIAL_SITE}).",
+
+    # About
+    "about.title": "About This Project",
+    "about.lead": "A student web development project that practices accessible, data-driven pages for a real-world cause.",
+    "about.kicker": "Behind the project",
+    "about.what.kicker": "The basics",
+    "about.what.heading": "What this site is",
+    "about.what.text": "This is a class project inspired by the San Diego Rescue Mission, a nonprofit that serves people "
+                       "experiencing homelessness in San Diego. We are not affiliated with the organization, and nothing here "
+                       "is official. All names, rates, shifts, addresses, and hours are placeholders stored in our database "
+                       "and marked “TODO: verify”.",
+    "about.what.image": "/images/sdrm/placeholder-volunteer.svg",
+    "about.what.imageAlt": "Placeholder illustration of a group of volunteers",
+    "about.built.heading": "Who built it",
+    "about.built.text": "Built by students in a computer science course as part of the Open Coding Society curriculum. "
+                        "Team member names are left out on purpose; add your team's first names or GitHub usernames here "
+                        "if your class requires it.",
+    "about.how.heading": "How it works",
+    "about.how.items": [
+        {"text": "Plain HTML, SASS, and vanilla JavaScript on a Jekyll site, with no frameworks, backed by a Python Flask server and database."},
+        {"text": "Its own small SASS system in `_sass/sdrm/` with color, font, and spacing tokens and one partial per component."},
+        {"text": "All of the site's text, links, and data come from our Flask server (`/api/sdrm/`), so updating information never requires editing the site."},
+        {"text": "Pages are built to work with a keyboard, a screen reader, and a phone screen 375 pixels wide."},
+    ],
+    "about.privacy.heading": "Privacy",
+    "about.privacy.text": "This site does not take payments. If you create an account, your name, email, and any guardian contact "
+                          "you add are stored on our server, along with the volunteer shifts you sign up for. You can cancel a "
+                          "shift or remove guardian info at any time.",
+    "about.privacy.cta": "Visit the official site",
+    "about.privacy.ctaHref": OFFICIAL_SITE,
+
+    # Account pages
+    "login.title": "Log In or Create an Account",
+    "login.lead": "Log in to your account, or make a new one in about a minute.",
+    "login.kicker": "Your account",
+    "login.login.heading": "Log in",
+    "login.login.text": "Welcome back. Enter your email and password.",
+    "login.signup.heading": "Create an account",
+    "login.signup.text": "New here? Fill in every field. If you're under 18, we'll also ask for a parent or guardian's contact.",
+    "login.note": "This is a student project. Don't reuse a password you use anywhere else.",
+    "profile.title": "Your Profile",
+    "profile.lead": "Your account details, and a parent or guardian's contact if you're under 18.",
+    "profile.kicker": "Your account",
+    "profile.account.heading": "Your account",
+    "profile.account.note": "Only an admin can change your role. Ask a volunteer coordinator if it looks wrong.",
+    "profile.guardian.heading": "Parent or guardian",
+    "profile.guardian.text": "Student volunteers under 18 add a parent or guardian we can contact. "
+                             "Leave both fields empty if you're 18 or older.",
+    "coordinator.title": "Coordinator Tools",
+    "coordinator.lead": "Tools for volunteer coordinators. The volunteer needs board is coming next.",
+    "coordinator.kicker": "Coordinators",
+}
 
 SEED_NEEDS = [("shelter", "Shelter"), ("meals", "Meals"), ("family", "Family services"), ("recovery", "Recovery")]
 
@@ -226,9 +433,14 @@ SEED_OPPORTUNITIES = [
 
 
 def init_sdrm():
-    """Create any missing SDRM tables and seed the empty ones. Safe to run on every start; never overwrites rows."""
+    """Create any missing SDRM tables, add missing text keys and seed the empty tables. Safe to run on every start; never overwrites rows."""
     with app.app_context():
         db.metadata.create_all(db.engine, tables=SDRM_TABLES)
+
+        # Add any text keys that are missing (new pages / sections); edited ones are kept
+        existing = {key for (key,) in db.session.query(SdrmContent.key)}
+        db.session.add_all(SdrmContent(key=key, value=json.dumps(value, ensure_ascii=False))
+                           for key, value in SEED_CONTENT.items() if key not in existing)
 
         if not SdrmNeed.query.first():
             db.session.add_all(SdrmNeed(id=i, label=label, position=n) for n, (i, label) in enumerate(SEED_NEEDS))

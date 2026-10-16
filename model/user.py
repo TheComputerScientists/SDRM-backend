@@ -39,6 +39,10 @@ def normalize_role(role):
         return None
     return next((r for r in ROLES if r.lower() == role.strip().lower()), None)
 
+# Sign-up limits (the SDRM site reads these from /api/sdrm/content to validate forms)
+NAME_MIN = 2
+PASSWORD_MIN = 8
+
 # Guardian contact for student volunteers under 18 (optional)
 GUARDIAN_NAME_MAX = 100
 GUARDIAN_EMAIL_MAX = 254
