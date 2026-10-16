@@ -34,6 +34,7 @@ from api.congrats_api import congrats_api  # Import the congrats API
 from api.profile_game import profile_game_api  # CS Pathway Game profile persistence
 from api.snapshot_proxy import snapshot_proxy
 from api.coordinator import coordinator_api  # SDRM coordinator-only routes
+from api.sdrm import sdrm_api  # SDRM site data (resources, rates, stats, volunteer shifts)
 #from api.announcement import announcement_api ##temporary revert
 
 # database Initialization functions
@@ -52,6 +53,7 @@ from model.post import Post, init_posts
 from model.microblog import MicroBlog, Topic, initMicroblogs
 from model.leaderboard import ScoreCounterEvent, ElementaryLeaderboardEvent
 from hacks.jokes import initJokes 
+from model.sdrm import init_sdrm
 # from model.announcement import Announcement ##temporary revert
 
 # server only Views
@@ -96,6 +98,7 @@ app.register_blueprint(congrats_api)  # Register the congrats message API
 app.register_blueprint(profile_game_api)  # CS Pathway Game profile persistence
 app.register_blueprint(snapshot_proxy)  # Register the snapshot proxy API
 app.register_blueprint(coordinator_api)  # SDRM coordinator-only routes
+app.register_blueprint(sdrm_api)  # SDRM site data
 # app.register_blueprint(announcement_api) ##temporary revert
 
 # Jokes file initialization
@@ -104,6 +107,9 @@ with app.app_context():
 
 # Add guardian columns and SDRM roles to an existing users table (safe to repeat, keeps data)
 migrate_user_roles()
+
+# Create and seed the SDRM site data tables if they're missing (keeps existing rows)
+init_sdrm()
 
 # Tell Flask-Login the view function name of your login route
 login_manager.login_view = "login"
@@ -365,6 +371,7 @@ def generate_data():
     initMicroblogs()
     initPersonas()
     initPersonaUsers()
+    init_sdrm()
 
 # Register the custom command group with the Flask application
 app.cli.add_command(custom_cli)
