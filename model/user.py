@@ -2,6 +2,7 @@
 from flask import current_app
 from flask_login import UserMixin
 from datetime import date
+from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 import os
@@ -21,6 +22,26 @@ def default_year():
     if 7 <= current_month <= 12:
         current_year = current_year + 1
     return current_year 
+
+""" Roles """
+
+# SDRM roles, stored with the template's capitalization so its existing "Admin" checks
+# keep working. Any other stored value (the template's "User", "Teacher", "Student", ...)
+# is treated as a volunteer.
+ROLE_VOLUNTEER = "Volunteer"
+ROLE_COORDINATOR = "Coordinator"
+ROLE_ADMIN = "Admin"
+ROLES = (ROLE_VOLUNTEER, ROLE_COORDINATOR, ROLE_ADMIN)
+
+def normalize_role(role):
+    """Return the stored spelling of a role name ("coordinator" -> "Coordinator"), or None if it isn't one."""
+    if not isinstance(role, str):
+        return None
+    return next((r for r in ROLES if r.lower() == role.strip().lower()), None)
+
+# Guardian contact for student volunteers under 18 (optional)
+GUARDIAN_NAME_MAX = 100
+GUARDIAN_EMAIL_MAX = 254
 
 """ Database Models """
 
@@ -134,13 +155,15 @@ class User(db.Model, UserMixin):
         _email (Column): A string representing the user's email address. It is not unique and cannot be null.
         _sid (Column): A string representing the user's student ID. It is not unique and can be null.
         _password (Column): A string representing the hashed password of the user. It is not unique and cannot be null.
-        _role (Column): A string representing the user's role within the application. Defaults to "User".
+        _role (Column): A string representing the user's role: "Volunteer" (default), "Coordinator" or "Admin".
         _pfp (Column): A string representing the path to the user's profile picture. It can be null.
         kasm_server_needed (Column): A boolean indicating whether the user requires a Kasm server.
         sections (Relationship): A many-to-many relationship between users and sections, allowing users to be associated with multiple sections.
         _grade_data (Column): A JSON object representing the user's grade data.
         _ap_exam (Column): A JSON object representing the user's AP exam data.
         _school (Column): A string representing the user's school, defaults to "Unknown".
+        _guardian_name (Column): Optional guardian name for student volunteers under 18.
+        _guardian_email (Column): Optional guardian email for student volunteers under 18.
     """
     __tablename__ = 'users'
 
@@ -150,7 +173,7 @@ class User(db.Model, UserMixin):
     _email = db.Column(db.String(255), unique=False, nullable=False)
     _sid = db.Column(db.String(255), unique=False, nullable=True)
     _password = db.Column(db.String(255), unique=False, nullable=False)
-    _role = db.Column(db.String(20), default="User", nullable=False)
+    _role = db.Column(db.String(20), default=ROLE_VOLUNTEER, nullable=False)
     _pfp = db.Column(db.String(255), unique=False, nullable=True)
     kasm_server_needed = db.Column(db.Boolean, default=False)
     _grade_data = db.Column(db.JSON, unique=False, nullable=True)
@@ -158,6 +181,8 @@ class User(db.Model, UserMixin):
     _class = db.Column(db.JSON, unique=False, nullable=True)
     _school = db.Column(db.String(255), default="Unknown", nullable=True)
     _game_profile = db.Column(db.JSON, unique=False, nullable=True)
+    _guardian_name = db.Column(db.String(GUARDIAN_NAME_MAX), nullable=True)
+    _guardian_email = db.Column(db.String(GUARDIAN_EMAIL_MAX), nullable=True)
     # Bumped every time the password actually changes (set_password). Embedded in issued
     # JWTs and in the Flask-Login session id (see get_id) and checked on every request, so
     # a stolen JWT or session cookie stops working the moment this account's password is
@@ -176,14 +201,14 @@ class User(db.Model, UserMixin):
     personas = db.relationship('Persona', secondary='user_personas', lazy='subquery',
                                overlaps="user_personas_rel,persona,users")
     
-    def __init__(self, name, uid, password=app.config["DEFAULT_PASSWORD"], kasm_server_needed=False, role="User", pfp='', grade_data=None, ap_exam=None, school="Unknown", sid=None, classes=None, game_profile=None):
+    def __init__(self, name, uid, password=app.config["DEFAULT_PASSWORD"], kasm_server_needed=False, role=ROLE_VOLUNTEER, pfp='', grade_data=None, ap_exam=None, school="Unknown", sid=None, classes=None, game_profile=None):
         self._name = name
         self._uid = uid
         self._email = "?"
         self._sid = sid
         self.set_password(password)
         self.kasm_server_needed = kasm_server_needed
-        self._role = role
+        self.role = role
         self._pfp = pfp
         self._grade_data = grade_data if grade_data else {}
         self._ap_exam = ap_exam if ap_exam else {}
@@ -307,13 +332,45 @@ class User(db.Model, UserMixin):
 
     @role.setter
     def role(self, role):
-        self._role = role
+        # Unknown or legacy roles ("User", "Teacher", ...) become Volunteer
+        self._role = normalize_role(role) or ROLE_VOLUNTEER
+
+    def has_role(self, *roles):
+        """True if the user's role is one of roles (any letter case), e.g. has_role("coordinator", "admin")."""
+        return self._role in {normalize_role(r) for r in roles}
 
     def is_admin(self):
-        return self._role == "Admin"
+        return self._role == ROLE_ADMIN
+
+    def is_coordinator(self):
+        """Coordinators and admins can use coordinator-only pages."""
+        return self.has_role(ROLE_COORDINATOR, ROLE_ADMIN)
 
     def is_teacher(self):
         return self._role == "Teacher"
+
+    @property
+    def guardian_name(self):
+        return self._guardian_name
+
+    @guardian_name.setter
+    def guardian_name(self, guardian_name):
+        self._guardian_name = guardian_name or None
+
+    @property
+    def guardian_email(self):
+        return self._guardian_email
+
+    @guardian_email.setter
+    def guardian_email(self, guardian_email):
+        self._guardian_email = guardian_email or None
+
+    def read_guardian(self):
+        """Guardian contact. Kept out of read() so list endpoints never show it; only for the user themselves (or an admin)."""
+        return {
+            "guardian_name": self._guardian_name,
+            "guardian_email": self._guardian_email,
+        }
     
     # getter method for profile picture
     @property
@@ -538,6 +595,11 @@ class User(db.Model, UserMixin):
         game_profile = inputs.get("game_profile", None)
         if game_profile is not None:
             self.game_profile = game_profile
+        # Guardian fields: an empty string clears them, a missing key leaves them alone
+        if "guardian_name" in inputs:
+            self.guardian_name = inputs["guardian_name"]
+        if "guardian_email" in inputs:
+            self.guardian_email = inputs["guardian_email"]
 
         # Check this on each update
         if not email:
@@ -740,6 +802,49 @@ class User(db.Model, UserMixin):
             new_path = os.path.join(current_app.config['UPLOAD_FOLDER'], self._uid)
             if os.path.exists(old_path):
                 os.rename(old_path, new_path)
+
+"""Database Migration """
+
+def migrate_user_roles():
+    """
+    Bring an existing users table up to date for volunteer roles, without losing data.
+
+    Safe to run any number of times (main.py runs it at startup; scripts/db_migrate_roles.py
+    runs it after taking a backup):
+      - adds the _guardian_name / _guardian_email columns if they are missing
+      - keeps Admin and Coordinator, and makes every other role (User, Teacher, ...) Volunteer
+
+    Returns {role: count} after the migration.
+    """
+    with app.app_context():
+        inspector = inspect(db.engine)
+        if 'users' not in inspector.get_table_names():
+            return {}  # fresh database: db.create_all() builds the new columns itself
+
+        columns = {column['name'] for column in inspector.get_columns('users')}
+        new_columns = {
+            '_guardian_name': f'VARCHAR({GUARDIAN_NAME_MAX})',
+            '_guardian_email': f'VARCHAR({GUARDIAN_EMAIL_MAX})',
+        }
+        with db.engine.begin() as conn:
+            for name, sql_type in new_columns.items():
+                if name not in columns:
+                    conn.execute(text(f'ALTER TABLE users ADD COLUMN {name} {sql_type}'))
+                    print(f"migrate_user_roles: added users.{name}")
+
+            # Fix letter case first ("admin" -> "Admin"), then everything else becomes Volunteer
+            for role in ROLES:
+                conn.execute(text('UPDATE users SET _role = :role WHERE lower(_role) = :lower AND _role != :role'),
+                             {'role': role, 'lower': role.lower()})
+            changed = conn.execute(
+                text('UPDATE users SET _role = :volunteer WHERE _role IS NULL OR _role NOT IN (:volunteer, :coordinator, :admin)'),
+                {'volunteer': ROLE_VOLUNTEER, 'coordinator': ROLE_COORDINATOR, 'admin': ROLE_ADMIN},
+            ).rowcount
+            if changed:
+                print(f"migrate_user_roles: {changed} user(s) set to {ROLE_VOLUNTEER}")
+
+            rows = conn.execute(text('SELECT _role, COUNT(*) FROM users GROUP BY _role')).fetchall()
+        return {role: count for role, count in rows}
 
 """Database Creation and Testing """
 

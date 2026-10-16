@@ -2,7 +2,7 @@ from flask import request, current_app, g
 from flask_login import current_user
 from functools import wraps
 import jwt
-from model.user import User
+from model.user import User, normalize_role
 
 def auth_required(roles=None):
     '''
@@ -138,3 +138,18 @@ def token_required(roles=None):
     Existing code using @token_required will continue to work.
     '''
     return auth_required(roles)
+
+
+
+def role_required(*roles):
+    '''
+    Allow only users with one of these SDRM roles, e.g. @role_required("coordinator", "admin").
+
+    Role names are matched without regard to letter case. Built on auth_required, so it returns
+      401 / Unauthorized when not logged in, and
+      403 / Forbidden when logged in with a role that isn't listed.
+    '''
+    allowed = [normalize_role(role) for role in roles]
+    if not roles or None in allowed:
+        raise ValueError(f"role_required: unknown role in {roles}")
+    return auth_required(allowed)

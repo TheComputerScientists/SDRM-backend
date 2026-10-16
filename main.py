@@ -33,10 +33,11 @@ from api.post import post_api  # Import the social media post API
 from api.congrats_api import congrats_api  # Import the congrats API
 from api.profile_game import profile_game_api  # CS Pathway Game profile persistence
 from api.snapshot_proxy import snapshot_proxy
+from api.coordinator import coordinator_api  # SDRM coordinator-only routes
 #from api.announcement import announcement_api ##temporary revert
 
 # database Initialization functions
-from model.user import User, initUsers
+from model.user import User, initUsers, migrate_user_roles
 from model.user import Section;
 from model.github import GitHubUser
 from model.feedback import Feedback
@@ -94,11 +95,15 @@ app.register_blueprint(post_api)  # Register the social media post API
 app.register_blueprint(congrats_api)  # Register the congrats message API
 app.register_blueprint(profile_game_api)  # CS Pathway Game profile persistence
 app.register_blueprint(snapshot_proxy)  # Register the snapshot proxy API
+app.register_blueprint(coordinator_api)  # SDRM coordinator-only routes
 # app.register_blueprint(announcement_api) ##temporary revert
 
 # Jokes file initialization
 with app.app_context():
     initJokes()
+
+# Add guardian columns and SDRM roles to an existing users table (safe to repeat, keeps data)
+migrate_user_roles()
 
 # Tell Flask-Login the view function name of your login route
 login_manager.login_view = "login"

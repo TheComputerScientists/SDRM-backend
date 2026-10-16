@@ -7,8 +7,8 @@ from flask import Blueprint, app, request, jsonify, current_app, Response, g
 from flask_restful import Api, Resource # used for REST API building
 from datetime import datetime, timedelta
 from __init__ import app, db
-from api.authorize import token_required
-from model.user import User
+from api.authorize import token_required, role_required
+from model.user import User, normalize_role, GUARDIAN_NAME_MAX, GUARDIAN_EMAIL_MAX
 import os
 import re
 
@@ -105,6 +105,39 @@ def _consume_reset_token(uid, token):
         return True
 
 
+def _guardian_fields(body, user=None):
+    """Validate the optional guardian_name / guardian_email in a request body.
+
+    Returns (fields, error_message). fields holds only the keys that were sent, trimmed,
+    with "" meaning "clear it". Name and email go together: after the change the user
+    must have both or neither (user is the account being updated, None on sign-up).
+    """
+    fields = {}
+    for key, label in (('guardian_name', 'Guardian name'), ('guardian_email', 'Guardian email')):
+        if key not in body:
+            continue
+        value = body.get(key)
+        if value is None:
+            value = ''
+        if not isinstance(value, str):
+            return None, f'{label} must be text'
+        fields[key] = value.strip()
+
+    name = fields.get('guardian_name', user.guardian_name if user else None) or ''
+    email = fields.get('guardian_email', user.guardian_email if user else None) or ''
+    if 'guardian_email' in fields:
+        email = fields['guardian_email'] = email.lower()
+
+    if name and not 2 <= len(name) <= GUARDIAN_NAME_MAX:
+        return None, f'Guardian name must be 2 to {GUARDIAN_NAME_MAX} characters'
+    if email and (len(email) > GUARDIAN_EMAIL_MAX or not EMAIL_PATTERN.fullmatch(email)):
+        return None, 'Guardian email is not a valid email address'
+    if name and not email:
+        return None, 'Guardian email is required when a guardian name is given'
+    if email and not name:
+        return None, 'Guardian name is required when a guardian email is given'
+    return fields, None
+
 def _without_password(user_data):
     """Strip the password hash before a user dict goes out over a general-purpose
     API response. The admin-only backup/export endpoints in data_export_import_api.py
@@ -124,7 +157,10 @@ class UserAPI:
             # Add role information to response
             user_data['role'] = current_user.role
             user_data['is_admin'] = current_user.is_admin()
+            user_data['is_coordinator'] = current_user.is_coordinator()
             user_data['is_teacher'] = current_user.is_teacher()
+            # Guardian contact is only ever returned to the user themselves
+            user_data.update(current_user.read_guardian())
             return jsonify(user_data)
     
     class _BULK(Resource):  # Users API operation for Create, Read, Update, Delete 
@@ -238,6 +274,12 @@ class UserAPI:
                 cleaned_body['class'] = body.get('class')
             if body.get('game_profile') is not None:
                 cleaned_body['game_profile'] = body.get('game_profile')
+            # Optional guardian contact for volunteers under 18. A "role" in the body is
+            # ignored on purpose: every sign-up starts as a Volunteer (see User.role).
+            guardian, error = _guardian_fields(body)
+            if error:
+                return {'message': error}, 400
+            cleaned_body.update({k: v for k, v in guardian.items() if v})
             
             # Remove None values
             cleaned_body = {k: v for k, v in cleaned_body.items() if v is not None}
@@ -363,12 +405,21 @@ class UserAPI:
             if body.get('uid') and body.get('uid') != user._uid:
                 if not UID_PATTERN.fullmatch(body.get('uid')):
                     return {'message': 'User ID can only use letters, numbers, dots, dashes and underscores (up to 40 characters)'}, 400
+
+            # Guardian contact: validated here, saved by user.update(); "" clears it
+            guardian, error = _guardian_fields(body, user)
+            if error:
+                return {'message': error}, 400
+            body.update(guardian)
             
             # Update the User object to the database using custom update method
             user.update(body)
 
             # return response, the updated user details as a JSON object
-            return jsonify(_without_password(user.read()))
+            user_data = _without_password(user.read())
+            if user.id == current_user.id:
+                user_data.update(user.read_guardian())
+            return jsonify(user_data)
         
         @token_required("Admin")
         def delete(self):
@@ -882,6 +933,27 @@ class UserAPI:
                 return {'message': f'Failed to reset password for {uid}'}, 500
             return {'message': f'Password reset for {uid}'}, 200
 
+    class _Role(Resource):
+        """Admin only: change a user's role. Sign-ups are always Volunteers; this is the only way up."""
+
+        @role_required("admin")
+        def put(self, user_id):
+            body = request.get_json(silent=True) or {}
+            role = normalize_role(body.get('role'))
+            if role is None:
+                return {'message': 'Role must be one of: volunteer, coordinator, admin'}, 400
+
+            user = User.query.get(user_id)
+            if user is None:
+                return {'message': f'User {user_id} not found'}, 404
+            if user.id == g.current_user.id:
+                # Stops an admin from locking themselves (or the last admin) out
+                return {'message': 'You can\'t change your own role'}, 400
+
+            user.role = role
+            db.session.commit()
+            return jsonify({'id': user.id, 'uid': user.uid, 'name': user.name, 'role': user.role})
+
     # building RESTapi endpoint
     api.add_resource(_ID, '/id')
     api.add_resource(_BULK, '/users')
@@ -893,6 +965,7 @@ class UserAPI:
     api.add_resource(_APExam, '/apexam')
     api.add_resource(_School, '/school')
     api.add_resource(_ResetPasswordVerified, '/reset-password')
+    api.add_resource(_Role, '/user/<int:user_id>/role')
     
     class _Class(Resource):
         """Manage the user's `class` list (e.g. CSSE, CSP, CSA).
