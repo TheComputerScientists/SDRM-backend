@@ -7,36 +7,18 @@ from flask import Blueprint, app, request, jsonify, current_app, Response, g
 from flask_restful import Api, Resource # used for REST API building
 from datetime import datetime, timedelta
 from __init__ import app, db
-from api.authorize import token_required, role_required
-from model.user import User, normalize_role, NAME_MIN, PASSWORD_MIN, GUARDIAN_NAME_MAX, GUARDIAN_EMAIL_MAX
+from api.authorize import token_required
+from model.user import User
+from model import account_types
+from model.google_token import verified_google_email
+from model.github import GitHubUser
 import os
-import re
 
 user_api = Blueprint('user_api', __name__,
                    url_prefix='/api')
 
 # API docs https://flask-restful.readthedocs.io/en/latest/api.html
 api = Api(user_api)
-
-# Allowed User IDs: 2-40 letters, numbers, dots, dashes or underscores (no GitHub account needed)
-UID_PATTERN = re.compile(r'[A-Za-z0-9._-]{2,40}')
-EMAIL_PATTERN = re.compile(r'[^\s@]+@[^\s@]+\.[^\s@]+')
-
-def _find_users_by_email(email):
-    """Users registered with this email, ignoring letter case."""
-    return User.query.filter(db.func.lower(User._email) == email.strip().lower()).all()
-
-def _uid_from_email(email):
-    """Make an unused User ID from the part of the email before the @, for sign-ups
-    that don't send one. People log in with their email, so they never need to know it."""
-    base = re.sub(r'[^A-Za-z0-9._-]', '', email.split('@')[0])[:30]
-    if len(base) < 2:
-        base = 'user'
-    uid, count = base, 1
-    while User.query.filter_by(_uid=uid).first():
-        count += 1
-        uid = f'{base}{count}'
-    return uid
 
 # Tokens this process has already spent, so a captured token can't be replayed against
 # Flask again within its own TTL -- Spring enforces single-use on its side too (consumed
@@ -105,39 +87,6 @@ def _consume_reset_token(uid, token):
         return True
 
 
-def _guardian_fields(body, user=None):
-    """Validate the optional guardian_name / guardian_email in a request body.
-
-    Returns (fields, error_message). fields holds only the keys that were sent, trimmed,
-    with "" meaning "clear it". Name and email go together: after the change the user
-    must have both or neither (user is the account being updated, None on sign-up).
-    """
-    fields = {}
-    for key, label in (('guardian_name', 'Guardian name'), ('guardian_email', 'Guardian email')):
-        if key not in body:
-            continue
-        value = body.get(key)
-        if value is None:
-            value = ''
-        if not isinstance(value, str):
-            return None, f'{label} must be text'
-        fields[key] = value.strip()
-
-    name = fields.get('guardian_name', user.guardian_name if user else None) or ''
-    email = fields.get('guardian_email', user.guardian_email if user else None) or ''
-    if 'guardian_email' in fields:
-        email = fields['guardian_email'] = email.lower()
-
-    if name and not NAME_MIN <= len(name) <= GUARDIAN_NAME_MAX:
-        return None, f'Guardian name must be {NAME_MIN} to {GUARDIAN_NAME_MAX} characters'
-    if email and (len(email) > GUARDIAN_EMAIL_MAX or not EMAIL_PATTERN.fullmatch(email)):
-        return None, 'Guardian email is not a valid email address'
-    if name and not email:
-        return None, 'Guardian email is required when a guardian name is given'
-    if email and not name:
-        return None, 'Guardian name is required when a guardian email is given'
-    return fields, None
-
 def _without_password(user_data):
     """Strip the password hash before a user dict goes out over a general-purpose
     API response. The admin-only backup/export endpoints in data_export_import_api.py
@@ -157,10 +106,7 @@ class UserAPI:
             # Add role information to response
             user_data['role'] = current_user.role
             user_data['is_admin'] = current_user.is_admin()
-            user_data['is_coordinator'] = current_user.is_coordinator()
             user_data['is_teacher'] = current_user.is_teacher()
-            # Guardian contact is only ever returned to the user themselves
-            user_data.update(current_user.read_guardian())
             return jsonify(user_data)
     
     class _BULK(Resource):  # Users API operation for Create, Read, Update, Delete 
@@ -223,34 +169,36 @@ class UserAPI:
             ''' Avoid garbage in, error checking '''
             # validate name
             name = body.get('name')
-            if name is None or len(name) < NAME_MIN:
-                return {'message': f'Name is missing, or is less than {NAME_MIN} characters'}, 400
+            if name is None or len(name) < 2:
+                return {'message': f'Name is missing, or is less than 2 characters'}, 400
             
-            # validate uid (any username; it no longer has to be a GitHub account)
+            # validate uid
             uid = body.get('uid')
-            if not uid:
-                # No User ID sent: the account is identified by its email instead
-                email = (body.get('email') or '').strip().lower()
-                if not EMAIL_PATTERN.fullmatch(email):
-                    return {'message': 'Email is missing, or is not a valid email address'}, 400
-                if _find_users_by_email(email):
-                    return {'message': 'Email is already registered'}, 409
-                body['email'] = email
-                uid = _uid_from_email(email)
             if uid is None or len(uid) < 2:
                 return {'message': f'User ID is missing, or is less than 2 characters'}, 400
-            if not UID_PATTERN.fullmatch(uid):
-                return {'message': 'User ID can only use letters, numbers, dots, dashes and underscores (up to 40 characters)'}, 400
+          
+            # check if uid is a GitHub account
+            _, status = GitHubUser().get(uid)
+            if status != 200:
+                return {'message': f'User ID {uid} not a valid GitHub account' }, 404
             
             ''' User object creation '''
+            # The account type (see model/account_types.json) sets the role. A type with Google
+            # domains is activated only when Google verifies an email in them for the submitted
+            # token; any other type stays inactive until a Teacher/Admin verifies it.
+            account_type = account_types.get(body.get('accountType'))
+            role = account_type['role']
+            domains = account_type['google_verified_domains']
+            verified_email = verified_google_email(body.get('idToken'), domains) if domains else None
+
             #1: Setup minimal User object using __init__ method
             password = body.get('password')
             if password is not None:
-                if len(password) < PASSWORD_MIN and not password.startswith("pbkdf2:sha256:"):
-                    return {'message': f'Password must be at least {PASSWORD_MIN} characters'}, 400
-                user_obj = User(name=name, uid=uid, password=password)
+                if len(password) < 8 and not password.startswith("pbkdf2:sha256:"):
+                    return {'message': 'Password must be at least 8 characters'}, 400
+                user_obj = User(name=name, uid=uid, password=password, role=role)
             else:
-                user_obj = User(name=name, uid=uid)
+                user_obj = User(name=name, uid=uid, role=role)
             
             # Handle additional fields that frontend sends
             # Create a cleaned body with only the fields User model expects
@@ -266,20 +214,12 @@ class UserAPI:
                 cleaned_body['sid'] = body.get('sid')
             if body.get('school'):
                 cleaned_body['school'] = body.get('school')
-            if body.get('kasm_server_needed') is not None:
-                cleaned_body['kasm_server_needed'] = body.get('kasm_server_needed')
             # Support assigning classes (e.g. ["CSSE","CSP","CSA"]).
             # Accept either a list or a single string.
             if body.get('class') is not None:
                 cleaned_body['class'] = body.get('class')
             if body.get('game_profile') is not None:
                 cleaned_body['game_profile'] = body.get('game_profile')
-            # Optional guardian contact for volunteers under 18. A "role" in the body is
-            # ignored on purpose: every sign-up starts as a Volunteer (see User.role).
-            guardian, error = _guardian_fields(body)
-            if error:
-                return {'message': error}, 400
-            cleaned_body.update({k: v for k, v in guardian.items() if v})
             
             # Remove None values
             cleaned_body = {k: v for k, v in cleaned_body.items() if v is not None}
@@ -300,6 +240,9 @@ class UserAPI:
                         return jsonify(_without_password(db_user.read()))  # Return the user anyway
                     else:
                         return {'message': f'Processed {name}, either a format error or User ID {uid} is duplicate'}, 400
+
+                if verified_email:
+                    user.activate()
 
                 #print(f"Successfully created user: {user.uid}")
                 # return response, the created user details as a JSON object
@@ -401,25 +344,17 @@ class UserAPI:
                 # Non-admin can only update themselves
                 user = current_user
                 
-            # A new User ID only has to match the username format (no GitHub account needed)
+            # Accounts are desired to be GitHub accounts, change must be validated 
             if body.get('uid') and body.get('uid') != user._uid:
-                if not UID_PATTERN.fullmatch(body.get('uid')):
-                    return {'message': 'User ID can only use letters, numbers, dots, dashes and underscores (up to 40 characters)'}, 400
-
-            # Guardian contact: validated here, saved by user.update(); "" clears it
-            guardian, error = _guardian_fields(body, user)
-            if error:
-                return {'message': error}, 400
-            body.update(guardian)
+                _, status = GitHubUser().get(body.get('uid'))
+                if status != 200:
+                    return {'message': f'User ID {body.get("uid")} not a valid GitHub account' }, 404
             
             # Update the User object to the database using custom update method
             user.update(body)
 
             # return response, the updated user details as a JSON object
-            user_data = _without_password(user.read())
-            if user.id == current_user.id:
-                user_data.update(user.read_guardian())
-            return jsonify(user_data)
+            return jsonify(_without_password(user.read()))
         
         @token_required("Admin")
         def delete(self):
@@ -440,7 +375,11 @@ class UserAPI:
             # bad request
             if user is None:
                 return {'message': f'User {uid} not found'}, 404
-           
+
+            blocker = user.deletion_blocker(g.current_user)
+            if blocker:
+                return {'message': blocker[1]}, blocker[0]
+
             # Read and then Delete the User object using custom methods
             user_json = _without_password(user.read())
             user.delete()
@@ -530,29 +469,19 @@ class UserAPI:
                     }, 400
                 ''' Get Data '''
                 uid = body.get('uid')
-                email = body.get('email')
-                if not uid and not email:
-                    return {'message': f'Email or User ID is missing'}, 401
-                if not uid and not EMAIL_PATTERN.fullmatch(email.strip()):
-                    # also keeps the "?" placeholder email of older accounts from matching
-                    return {'message': f"Invalid email, user id or password"}, 401
+                if uid is None:
+                    return {'message': f'User ID is missing'}, 401
                 password = body.get('password')
                 if not password:
                     return {'message': f'Password is missing'}, 401
                             
-                ''' Find user, by User ID or by email '''
+                ''' Find user '''
     
-                if uid:
-                    user = User.query.filter_by(_uid=uid).first()
-                    if user is not None and not user.is_password(password):
-                        user = None
-                else:
-                    # Older accounts may share an email, so take the one this password fits
-                    user = next((u for u in _find_users_by_email(email) if u.is_password(password)), None)
+                user = User.query.filter_by(_uid=uid).first()
                 
-                if user is None:
+                if user is None or not user.is_password(password):
                     
-                    return {'message': f"Invalid email, user id or password"}, 401
+                    return {'message': f"Invalid user id or password"}, 401
                             
                 # Check if user is found
                 if user:
@@ -876,7 +805,6 @@ class UserAPI:
                 'email': email,
                 'sid': sid,
                 'school': school,
-                'kasm_server_needed': False
             }
             if body.get('class') is not None:
                 cleaned_body['class'] = body.get('class')
@@ -918,8 +846,8 @@ class UserAPI:
 
             if not uid or not reset_token or not password:
                 return {'message': 'uid, resetToken, and newPassword are required'}, 400
-            if len(password) < PASSWORD_MIN:
-                return {'message': f'Password must be at least {PASSWORD_MIN} characters'}, 400
+            if len(password) < 8:
+                return {'message': 'Password must be at least 8 characters'}, 400
             if not _consume_reset_token(uid, reset_token):
                 return {'message': 'Invalid, expired, or already-used reset token'}, 403
 
@@ -933,26 +861,75 @@ class UserAPI:
                 return {'message': f'Failed to reset password for {uid}'}, 500
             return {'message': f'Password reset for {uid}'}, 200
 
-    class _Role(Resource):
-        """Admin only: change a user's role. Sign-ups are always Volunteers; this is the only way up."""
+    class _VerifyAccount(Resource):
+        """Teacher/Admin verifies any account: marks it active and records last_verified.
+        How long that covers is fixed for some roles (see model/account_types.json); for the
+        others the optional JSON body {"days": N} says (1 up to the full interval), and
+        default_verification_days applies when it is left out."""
+        @token_required(["Teacher", "Admin"])
+        def post(self, uid):
+            target = User.query.filter_by(_uid=uid).first()
+            if target is None:
+                return {'message': f'User {uid} not found'}, 404
+            days = account_types.fixed_verification_days(target.role)
+            if days is None:
+                body = request.get_json(silent=True)
+                if body is not None and not isinstance(body, dict):
+                    return {'message': 'The body must be a JSON object such as {"days": 30}'}, 400
+                days = (body or {}).get('days', account_types.default_verification_days())
+            interval = account_types.verification_interval_days()
+            if not isinstance(days, int) or isinstance(days, bool) or not 1 <= days <= interval:
+                return {'message': f'days must be a whole number from 1 to {interval}'}, 400
+            return jsonify(_without_password(target.activate(days).read()))
 
-        @role_required("admin")
-        def put(self, user_id):
-            body = request.get_json(silent=True) or {}
-            role = normalize_role(body.get('role'))
-            if role is None:
-                return {'message': 'Role must be one of: volunteer, coordinator, admin'}, 400
+    class _DeactivateAccount(Resource):
+        """Teacher/Admin marks an account inactive. The account and its data are kept."""
+        @token_required(["Teacher", "Admin"])
+        def post(self, uid):
+            target = User.query.filter_by(_uid=uid).first()
+            if target is None:
+                return {'message': f'User {uid} not found'}, 404
+            blocker = target.deactivation_blocker(g.current_user)
+            if blocker:
+                return {'message': blocker[1]}, blocker[0]
+            return jsonify(_without_password(target.deactivate().read()))
 
-            user = User.query.get(user_id)
-            if user is None:
-                return {'message': f'User {user_id} not found'}, 404
-            if user.id == g.current_user.id:
-                # Stops an admin from locking themselves (or the last admin) out
-                return {'message': 'You can\'t change your own role'}, 400
-
-            user.role = role
+    class _ChangeRole(Resource):
+        """Teacher/Admin changes another account's role: POST {"role": "Mentor"}. Only an Admin can
+        make someone an Admin or change an Admin's role; nobody changes their own role."""
+        @token_required(["Teacher", "Admin"])
+        def post(self, uid):
+            target = User.query.filter_by(_uid=uid).first()
+            if target is None:
+                return {'message': f'User {uid} not found'}, 404
+            body = request.get_json(silent=True)
+            role = body.get('role') if isinstance(body, dict) else None
+            blocker = target.role_change_blocker(g.current_user, role)
+            if blocker:
+                return {'message': blocker[1]}, blocker[0]
+            target.role = role
             db.session.commit()
-            return jsonify({'id': user.id, 'uid': user.uid, 'name': user.name, 'role': user.role})
+            return jsonify(_without_password(target.read()))
+
+    class _AdminCreate(Resource):
+        """Teacher/Admin creates an account of a staff-created type (see
+        model/account_types.json). The account starts inactive and follows the same
+        verification step as a self-created one."""
+        @token_required(["Teacher", "Admin"])
+        def post(self):
+            body = request.get_json(silent=True) or {}
+            allowed = account_types.staff_created()
+            role = allowed.get((body.get('accountType') or '').lower())
+            name, uid, password = body.get('name'), body.get('uid'), body.get('password')
+            if role is None:
+                return {'message': f"accountType must be one of: {', '.join(allowed)}"}, 400
+            if not name or not uid or not password or len(password) < 8:
+                return {'message': 'name, uid and a password of at least 8 characters are required'}, 400
+            user = User(name=name, uid=uid, password=password, role=role).create(
+                {'email': body['email']} if body.get('email') else None)
+            if not user:
+                return {'message': f'User ID {uid} is a duplicate or invalid'}, 400
+            return jsonify(_without_password(user.read()))
 
     # building RESTapi endpoint
     api.add_resource(_ID, '/id')
@@ -965,7 +942,10 @@ class UserAPI:
     api.add_resource(_APExam, '/apexam')
     api.add_resource(_School, '/school')
     api.add_resource(_ResetPasswordVerified, '/reset-password')
-    api.add_resource(_Role, '/user/<int:user_id>/role')
+    api.add_resource(_VerifyAccount, '/user/<string:uid>/verify')
+    api.add_resource(_DeactivateAccount, '/user/<string:uid>/deactivate')
+    api.add_resource(_ChangeRole, '/user/<string:uid>/role')
+    api.add_resource(_AdminCreate, '/user/admin-create')
     
     class _Class(Resource):
         """Manage the user's `class` list (e.g. CSSE, CSP, CSA).

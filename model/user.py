@@ -1,16 +1,15 @@
 """ database dependencies to support sqliteDB examples """
 from flask import current_app
 from flask_login import UserMixin
-from datetime import date
-from sqlalchemy import inspect, text
+from datetime import date, datetime, timedelta
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 import os
 import json
 
 from __init__ import app, db
+from model import account_types
 from model.github import GitHubUser
-from model.kasm import KasmUser
 
 """ Helper Functions """
 
@@ -22,30 +21,6 @@ def default_year():
     if 7 <= current_month <= 12:
         current_year = current_year + 1
     return current_year 
-
-""" Roles """
-
-# SDRM roles, stored with the template's capitalization so its existing "Admin" checks
-# keep working. Any other stored value (the template's "User", "Teacher", "Student", ...)
-# is treated as a volunteer.
-ROLE_VOLUNTEER = "Volunteer"
-ROLE_COORDINATOR = "Coordinator"
-ROLE_ADMIN = "Admin"
-ROLES = (ROLE_VOLUNTEER, ROLE_COORDINATOR, ROLE_ADMIN)
-
-def normalize_role(role):
-    """Return the stored spelling of a role name ("coordinator" -> "Coordinator"), or None if it isn't one."""
-    if not isinstance(role, str):
-        return None
-    return next((r for r in ROLES if r.lower() == role.strip().lower()), None)
-
-# Sign-up limits (the SDRM frontend checks the same numbers in assets/js/sdrm/auth.js and login.js)
-NAME_MIN = 2
-PASSWORD_MIN = 8
-
-# Guardian contact for student volunteers under 18 (optional)
-GUARDIAN_NAME_MAX = 100
-GUARDIAN_EMAIL_MAX = 254
 
 """ Database Models """
 
@@ -159,15 +134,12 @@ class User(db.Model, UserMixin):
         _email (Column): A string representing the user's email address. It is not unique and cannot be null.
         _sid (Column): A string representing the user's student ID. It is not unique and can be null.
         _password (Column): A string representing the hashed password of the user. It is not unique and cannot be null.
-        _role (Column): A string representing the user's role: "Volunteer" (default), "Coordinator" or "Admin".
+        _role (Column): A string representing the user's role within the application. Defaults to "User".
         _pfp (Column): A string representing the path to the user's profile picture. It can be null.
-        kasm_server_needed (Column): A boolean indicating whether the user requires a Kasm server.
         sections (Relationship): A many-to-many relationship between users and sections, allowing users to be associated with multiple sections.
         _grade_data (Column): A JSON object representing the user's grade data.
         _ap_exam (Column): A JSON object representing the user's AP exam data.
         _school (Column): A string representing the user's school, defaults to "Unknown".
-        _guardian_name (Column): Optional guardian name for student volunteers under 18.
-        _guardian_email (Column): Optional guardian email for student volunteers under 18.
     """
     __tablename__ = 'users'
 
@@ -177,21 +149,27 @@ class User(db.Model, UserMixin):
     _email = db.Column(db.String(255), unique=False, nullable=False)
     _sid = db.Column(db.String(255), unique=False, nullable=True)
     _password = db.Column(db.String(255), unique=False, nullable=False)
-    _role = db.Column(db.String(20), default=ROLE_VOLUNTEER, nullable=False)
+    _role = db.Column(db.String(20), default="User", nullable=False)
     _pfp = db.Column(db.String(255), unique=False, nullable=True)
-    kasm_server_needed = db.Column(db.Boolean, default=False)
     _grade_data = db.Column(db.JSON, unique=False, nullable=True)
     _ap_exam = db.Column(db.JSON, unique=False, nullable=True)
     _class = db.Column(db.JSON, unique=False, nullable=True)
     _school = db.Column(db.String(255), default="Unknown", nullable=True)
     _game_profile = db.Column(db.JSON, unique=False, nullable=True)
-    _guardian_name = db.Column(db.String(GUARDIAN_NAME_MAX), nullable=True)
-    _guardian_email = db.Column(db.String(GUARDIAN_EMAIL_MAX), nullable=True)
     # Bumped every time the password actually changes (set_password). Embedded in issued
     # JWTs and in the Flask-Login session id (see get_id) and checked on every request, so
     # a stolen JWT or session cookie stops working the moment this account's password is
     # reset, instead of staying valid for the rest of its lifetime.
     token_version = db.Column(db.Integer, default=0, nullable=False)
+    # Account lifecycle. New accounts are inactive until explicitly verified.
+    # An existing database needs this once, BEFORE this code is deployed (db.create_all()
+    # does not add columns to an existing table). The UPDATE keeps every existing account
+    # active, and due for re-verification in January:
+    #   ALTER TABLE users ADD COLUMN active BOOLEAN NOT NULL DEFAULT 0;
+    #   ALTER TABLE users ADD COLUMN last_verified DATETIME NULL;
+    #   UPDATE users SET active = 1, last_verified = '2026-01-30 00:00:00';
+    active = db.Column(db.Boolean, default=False, nullable=False)
+    last_verified = db.Column(db.DateTime, nullable=True)
 
     # Define many-to-many relationship with Section model through UserSection table
     # Overlaps setting silences SQLAlchemy warnings about multiple relationship paths
@@ -205,14 +183,13 @@ class User(db.Model, UserMixin):
     personas = db.relationship('Persona', secondary='user_personas', lazy='subquery',
                                overlaps="user_personas_rel,persona,users")
     
-    def __init__(self, name, uid, password=app.config["DEFAULT_PASSWORD"], kasm_server_needed=False, role=ROLE_VOLUNTEER, pfp='', grade_data=None, ap_exam=None, school="Unknown", sid=None, classes=None, game_profile=None):
+    def __init__(self, name, uid, password=app.config["DEFAULT_PASSWORD"], role="User", pfp='', grade_data=None, ap_exam=None, school="Unknown", sid=None, classes=None, game_profile=None):
         self._name = name
         self._uid = uid
         self._email = "?"
         self._sid = sid
         self.set_password(password)
-        self.kasm_server_needed = kasm_server_needed
-        self.role = role
+        self._role = role
         self._pfp = pfp
         self._grade_data = grade_data if grade_data else {}
         self._ap_exam = ap_exam if ap_exam else {}
@@ -336,46 +313,101 @@ class User(db.Model, UserMixin):
 
     @role.setter
     def role(self, role):
-        # Unknown or legacy roles ("User", "Teacher", ...) become Volunteer
-        self._role = normalize_role(role) or ROLE_VOLUNTEER
-
-    def has_role(self, *roles):
-        """True if the user's role is one of roles (any letter case), e.g. has_role("coordinator", "admin")."""
-        return self._role in {normalize_role(r) for r in roles}
+        self._role = role
 
     def is_admin(self):
-        return self._role == ROLE_ADMIN
-
-    def is_coordinator(self):
-        """Coordinators and admins can use coordinator-only pages."""
-        return self.has_role(ROLE_COORDINATOR, ROLE_ADMIN)
+        return self._role == "Admin"
 
     def is_teacher(self):
         return self._role == "Teacher"
 
-    @property
-    def guardian_name(self):
-        return self._guardian_name
-
-    @guardian_name.setter
-    def guardian_name(self, guardian_name):
-        self._guardian_name = guardian_name or None
+    def is_staff(self):
+        """True for the roles that manage accounts (staff_roles in account_types.json)."""
+        return self.role in account_types.staff_roles()
 
     @property
-    def guardian_email(self):
-        return self._guardian_email
+    def verification_state(self):
+        if not self.active:
+            return "inactive"
+        if self.role in account_types.verification_exempt_roles():
+            return "active_verified"  # never re-verified
+        if self.last_verified is None or datetime.utcnow() - self.last_verified >= timedelta(days=account_types.verification_interval_days()):
+            return "active_verification_required"
+        return "active_verified"
 
-    @guardian_email.setter
-    def guardian_email(self, guardian_email):
-        self._guardian_email = guardian_email or None
-
-    def read_guardian(self):
-        """Guardian contact. Kept out of read() so list endpoints never show it; only for the user themselves (or an admin)."""
-        return {
-            "guardian_name": self._guardian_name,
-            "guardian_email": self._guardian_email,
-        }
+    def activate(self, days=None):
+        """Verify the account: mark it active and record when. days is how long the verification
+        should last, up to the full interval; without it, the full interval."""
+        interval = account_types.verification_interval_days()
+        used = interval if days is None else min(days, interval)
+        self.active = True
+        self.last_verified = datetime.utcnow() - timedelta(days=interval - used)
+        db.session.commit()
+        return self
     
+    def deactivate(self):
+        """Mark the account inactive. The account, its data and last_verified are kept."""
+        self.active = False
+        db.session.commit()
+        return self
+
+    def is_last_active_essential(self):
+        """True when this is the only active account of a role the system must keep."""
+        return (self.active and self.role in account_types.essential_roles()
+                and User.query.filter_by(_role=self.role, active=True).count() == 1)
+
+    def deactivation_blocker(self, actor):
+        """None if actor may deactivate this account, else (HTTP status, reason)."""
+        if self.is_admin() and not actor.is_admin():
+            return 403, "Only an Admin can deactivate an Admin"
+        if self.is_last_active_essential():
+            return 409, f"At least one active {self.role} account must remain"
+        return None
+
+    def role_editable_by(self, actor):
+        """True when actor may change this account's role at all: not their own, and only an
+        Admin may change an Admin's. Whatever role the account has now."""
+        return self.id != actor.id and (actor.is_admin() or not self.is_admin())
+
+    def grantable_roles(self):
+        """The roles this account may give to another account. Only an Admin may grant Admin."""
+        return tuple(r for r in account_types.assignable_roles() if r != "Admin" or self.is_admin())
+
+    def role_change_blocker(self, actor, new_role):
+        """None if actor may set this account's role to new_role, else (HTTP status, reason)."""
+        if new_role not in account_types.assignable_roles():
+            return 400, f"role must be one of: {', '.join(account_types.assignable_roles())}"
+        if self.id == actor.id:
+            return 403, "You cannot change your own role"
+        if not self.role_editable_by(actor) or new_role not in actor.grantable_roles():
+            return 403, "Only an Admin can change an Admin's role or make someone an Admin"
+        if new_role != self.role and self.is_last_active_essential():
+            return 409, f"At least one active {self.role} account must remain"
+        return None
+
+    def deletion_blocker(self, actor):
+        """None if actor may delete this account, else (HTTP status, reason)."""
+        if not (actor.is_admin() and actor.active):
+            return 403, "Only an active Admin can delete accounts"
+        if self.id == actor.id:
+            return 403, "You cannot delete your own account; another Admin must do it"
+        if self.is_last_active_essential():
+            return 409, f"At least one active {self.role} account must remain"
+        return None
+
+    @property
+    def verification_due(self):
+        """True while the account is inactive or its verification has lapsed."""
+        return self.verification_state != "active_verified"
+
+    @property
+    def verification_prompt_days(self):
+        """The suggested days to ask a Teacher/Admin for when they activate this account, or None
+        when the answer is not theirs to choose (a fixed period, or a role never re-verified)."""
+        if account_types.fixed_verification_days(self.role) is not None:
+            return None
+        return account_types.default_verification_days()
+
     # getter method for profile picture
     @property
     def pfp(self):
@@ -535,12 +567,14 @@ class User(db.Model, UserMixin):
             "role": self.role,
             "pfp": self.pfp,
             "class": self._class if self._class is not None else [],
-            "kasm_server_needed": self.kasm_server_needed,
             "grade_data": self.grade_data,
             "ap_exam": self.ap_exam,
             "password": self._password,  # Only for internal use, not for API
             "school": self.school,
             "game_profile": self.game_profile,
+            "active": self.active,
+            "last_verified": self.last_verified.isoformat() if self.last_verified else None,
+            "verification_state": self.verification_state,
         }
         sections = self.read_sections()
         data.update(sections)
@@ -560,15 +594,10 @@ class User(db.Model, UserMixin):
         sid = inputs.get("sid", "")
         password = inputs.get("password", "")
         pfp = inputs.get("pfp", None)
-        kasm_server_needed = inputs.get("kasm_server_needed", None)
         grade_data = inputs.get("grade_data", None)
         ap_exam = inputs.get("ap_exam", None)
         class_list = inputs.get("class", None) or inputs.get("_class", None)
         school = inputs.get("school", None)
-        # States before update
-        old_uid = self.uid
-        old_kasm_server_needed = self.kasm_server_needed
-
         # Update table with new data
         if name:
             self.name = name
@@ -582,8 +611,6 @@ class User(db.Model, UserMixin):
             self.set_password(password)
         if pfp is not None:
             self.pfp = pfp
-        if kasm_server_needed is not None:
-            self.kasm_server_needed = bool(kasm_server_needed)
         if grade_data is not None:
             self.grade_data = grade_data
         if ap_exam is not None:
@@ -599,38 +626,11 @@ class User(db.Model, UserMixin):
         game_profile = inputs.get("game_profile", None)
         if game_profile is not None:
             self.game_profile = game_profile
-        # Guardian fields: an empty string clears them, a missing key leaves them alone
-        if "guardian_name" in inputs:
-            self.guardian_name = inputs["guardian_name"]
-        if "guardian_email" in inputs:
-            self.guardian_email = inputs["guardian_email"]
 
         # Check this on each update
         if not email:
             if email == "?":
                 self.set_email()
-
-        # Make a KasmUser object to interact with the Kasm API
-        # Wrap in try-except to ensure db.session.commit() occurs even if Kasm operations fail
-        try:
-            kasm_user = KasmUser()
-
-            # Update Kasm server group membership if needed
-            if self.kasm_server_needed:
-                # UID has changed, delete old Kasm user if it exists
-                if old_uid != self.uid:
-                    kasm_user.delete(old_uid)
-                # Create or update the user in Kasm, including a password
-                kasm_user.post(self.name, self.uid, password if password else app.config["DEFAULT_PASSWORD"])
-                # User is transtioning from non-Kasm to Kasm user, thus it requires posting all groups to Kasm
-                if not old_kasm_server_needed:
-                    kasm_user.post_groups(self.uid, [section.abbreviation for section in self.sections])
-            # User is transitioning from Kasm user to non-Kasm user, thus it requires cleanup of defunct Kasm user
-            elif old_kasm_server_needed:
-                kasm_user.delete(self.uid)
-        except Exception as e:
-            # Log the error but continue to db.session.commit()
-            print(f"Kasm API error for user {self.uid}: {e}")
 
         try:
             db.session.commit()
@@ -643,7 +643,6 @@ class User(db.Model, UserMixin):
     # None
     def delete(self):
         try:
-            KasmUser().delete(self.uid)
             db.session.delete(self)
             db.session.commit()
         except IntegrityError:
@@ -683,9 +682,6 @@ class User(db.Model, UserMixin):
         else:
             # Handle the case where the section exists
             print("Section with abbreviation '{}' exists.".format(section._abbreviation))
-        # update kasm group membership
-        if self.kasm_server_needed:
-            KasmUser().post_groups(self.uid, [section.abbreviation])
         return self
     
     def add_sections(self, sections):
@@ -807,49 +803,6 @@ class User(db.Model, UserMixin):
             if os.path.exists(old_path):
                 os.rename(old_path, new_path)
 
-"""Database Migration """
-
-def migrate_user_roles():
-    """
-    Bring an existing users table up to date for volunteer roles, without losing data.
-
-    Safe to run any number of times (main.py runs it at startup; scripts/db_migrate_roles.py
-    runs it after taking a backup):
-      - adds the _guardian_name / _guardian_email columns if they are missing
-      - keeps Admin and Coordinator, and makes every other role (User, Teacher, ...) Volunteer
-
-    Returns {role: count} after the migration.
-    """
-    with app.app_context():
-        inspector = inspect(db.engine)
-        if 'users' not in inspector.get_table_names():
-            return {}  # fresh database: db.create_all() builds the new columns itself
-
-        columns = {column['name'] for column in inspector.get_columns('users')}
-        new_columns = {
-            '_guardian_name': f'VARCHAR({GUARDIAN_NAME_MAX})',
-            '_guardian_email': f'VARCHAR({GUARDIAN_EMAIL_MAX})',
-        }
-        with db.engine.begin() as conn:
-            for name, sql_type in new_columns.items():
-                if name not in columns:
-                    conn.execute(text(f'ALTER TABLE users ADD COLUMN {name} {sql_type}'))
-                    print(f"migrate_user_roles: added users.{name}")
-
-            # Fix letter case first ("admin" -> "Admin"), then everything else becomes Volunteer
-            for role in ROLES:
-                conn.execute(text('UPDATE users SET _role = :role WHERE lower(_role) = :lower AND _role != :role'),
-                             {'role': role, 'lower': role.lower()})
-            changed = conn.execute(
-                text('UPDATE users SET _role = :volunteer WHERE _role IS NULL OR _role NOT IN (:volunteer, :coordinator, :admin)'),
-                {'volunteer': ROLE_VOLUNTEER, 'coordinator': ROLE_COORDINATOR, 'admin': ROLE_ADMIN},
-            ).rowcount
-            if changed:
-                print(f"migrate_user_roles: {changed} user(s) set to {ROLE_VOLUNTEER}")
-
-            rows = conn.execute(text('SELECT _role, COUNT(*) FROM users GROUP BY _role')).fetchall()
-        return {role: count for role, count in rows}
-
 """Database Creation and Testing """
 
 # Builds working data set for testing
@@ -894,7 +847,7 @@ def initUsers():
             'last_updated': None
         }
 
-        u1 = User(name=app.config['ADMIN_USER'], uid=app.config['ADMIN_UID'], password=app.config['ADMIN_PASSWORD'], pfp=app.config['ADMIN_PFP'], kasm_server_needed=True, role="Admin")
+        u1 = User(name=app.config['ADMIN_USER'], uid=app.config['ADMIN_UID'], password=app.config['ADMIN_PASSWORD'], pfp=app.config['ADMIN_PFP'], role="Admin")
         u2 = User(name=app.config['USER_NAME'], uid=app.config['USER_UID'], password=app.config['USER_PASSWORD'], pfp=app.config['USER_PFP'])
         u3 = User(name=app.config['TEACHER_USER'], uid=app.config['TEACHER_UID'], pfp=app.config['TEACHER_PFP'], password=app.config['TEACHER_PASSWORD'], role='Teacher')
         u4 = User(name=app.config['MY_NAME'], uid=app.config['MY_UID'], pfp=app.config['MY_PFP'], password=app.config['MY_PASSWORD'], role=app.config['MY_ROLE'])
@@ -902,6 +855,8 @@ def initUsers():
         users = [u1, u2, u3, u4]
         
         for user in users:
+            user.active = True
+            user.last_verified = datetime.utcnow()
             try:
                 user.create()
             except IntegrityError:

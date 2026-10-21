@@ -76,6 +76,9 @@ app.config['DEFAULT_PFP'] = os.environ.get('DEFAULT_PFP') or 'default.png'
 # tokens locally (no call back to Spring). No default -- unset means the
 # frontend-driven reset-password endpoint is closed.
 app.config['RESET_TOKEN_SECRET'] = os.environ.get('RESET_TOKEN_SECRET')
+# OAuth client ID a student's Google ID token must be issued for. No default: unset means
+# no signup is auto-activated.
+app.config['GOOGLE_CLIENT_ID'] = os.environ.get('GOOGLE_CLIENT_ID')
 # Convenience user
 app.config['MY_NAME'] = os.environ.get('MY_NAME') or 'convenience'
 app.config['MY_UID'] = os.environ.get('MY_UID') or 'convenience'
@@ -147,12 +150,6 @@ app.config['GITHUB_TARGET_NAME'] = os.environ.get('GITHUB_TARGET_NAME') or 'open
 # Gemini API settingsa
 app.config['GEMINI_SERVER'] = os.environ.get('GEMINI_SERVER') or 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent'
 app.config['GEMINI_API_KEY'] = os.environ.get('GEMINI_API_KEY') or None
-
-
-# KASM settings
-app.config['KASM_SERVER'] = os.environ.get('KASM_SERVER') or 'https://kasm.opencodingsociety.com'
-app.config['KASM_API_KEY'] = os.environ.get('KASM_API_KEY') or None
-app.config['KASM_API_KEY_SECRET'] = os.environ.get('KASM_API_KEY_SECRET') or None
 
 
 # GROQ API settings
