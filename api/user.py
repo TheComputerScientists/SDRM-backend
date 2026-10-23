@@ -8,7 +8,7 @@ from flask_restful import Api, Resource # used for REST API building
 from datetime import datetime, timedelta
 from __init__ import app, db
 from api.authorize import token_required
-from model.user import User
+from model.user import User, meets_password_rule, WeakPasswordError
 from model import account_types
 from model.google_token import verified_google_email
 from model.github import GitHubUser
@@ -85,6 +85,15 @@ def _consume_reset_token(uid, token):
 
         _consumed_reset_tokens[token] = exp
         return True
+
+
+def _staff_caller():
+    """The logged-in, active Teacher or Admin making this request, or None. It asks the same
+    token_required check every staff endpoint uses, so an inactive account, a stale or garbage
+    login, and a role that is not in staff_roles all come back as None."""
+    probe = token_required(account_types.staff_roles())(lambda: g.current_user)
+    caller = probe()
+    return caller if isinstance(caller, User) else None
 
 
 def _without_password(user_data):
@@ -177,10 +186,13 @@ class UserAPI:
             if uid is None or len(uid) < 2:
                 return {'message': f'User ID is missing, or is less than 2 characters'}, 400
           
-            # check if uid is a GitHub account
-            _, status = GitHubUser().get(uid)
-            if status != 200:
-                return {'message': f'User ID {uid} not a valid GitHub account' }, 404
+            # check if uid is a GitHub account. A logged-in Teacher or Admin may create test
+            # accounts that are not.
+            staff = _staff_caller()
+            if staff is None:
+                _, status = GitHubUser().get(uid)
+                if status != 200:
+                    return {'message': f'User ID {uid} not a valid GitHub account' }, 404
             
             ''' User object creation '''
             # The account type (see model/account_types.json) sets the role. A type with Google
@@ -194,8 +206,7 @@ class UserAPI:
             #1: Setup minimal User object using __init__ method
             password = body.get('password')
             if password is not None:
-                if len(password) < 8 and not password.startswith("pbkdf2:sha256:"):
-                    return {'message': 'Password must be at least 8 characters'}, 400
+                # The model rejects a password that breaks the rule (WeakPasswordError -> 400).
                 user_obj = User(name=name, uid=uid, password=password, role=role)
             else:
                 user_obj = User(name=name, uid=uid, role=role)
@@ -243,6 +254,9 @@ class UserAPI:
 
                 if verified_email:
                     user.activate()
+                if staff is not None:
+                    # %r quotes the uid, so a newline in it cannot forge a second log line
+                    current_app.logger.info("AUDIT signup uid=%r created by staff uid=%r without a GitHub check", user.uid, staff.uid)
 
                 #print(f"Successfully created user: {user.uid}")
                 # return response, the created user details as a JSON object
@@ -292,7 +306,7 @@ class UserAPI:
             for user in users:
                 user_data = _without_password(user.read())
                 # Add access control
-                if current_user.role == 'Admin' or current_user.id == user.id:
+                if current_user.is_admin() or current_user.id == user.id:
                     user_data['access'] = ['rw'] # read-write access control 
                 else:
                     user_data['access'] = ['ro'] # read-only access control 
@@ -330,7 +344,7 @@ class UserAPI:
             body = request.get_json()
 
             ''' Admin-specific update handling '''
-            if current_user.role == 'Admin':
+            if current_user.is_admin():
                 uid = body.get('uid')
                 # Admin is updating themself
                 if uid is None or uid == current_user.uid:
@@ -356,7 +370,7 @@ class UserAPI:
             # return response, the updated user details as a JSON object
             return jsonify(_without_password(user.read()))
         
-        @token_required("Admin")
+        @token_required(account_types.admin_role())
         def delete(self):
             """
             Delete a user.
@@ -502,6 +516,7 @@ class UserAPI:
                         # Return JSON response with cookie
                         is_production = os.environ.get('IS_PRODUCTION', 'false').lower() == 'true'
                         
+                        state = user.verification_state
                         # Create JSON response
                         response_data = {
                             "message": f"Authentication for {user._uid} successful",
@@ -509,7 +524,11 @@ class UserAPI:
                                 "uid": user._uid,
                                 "name": user.name,
                                 "role": user.role,
-                                "class": user._class if getattr(user, '_class', None) is not None else []
+                                "class": user._class if getattr(user, '_class', None) is not None else [],
+                                "active": user.active,
+                                "verification_state": state,
+                                "verification_required": state == "active_verification_required",
+                                "verified_by_google": bool(account_types.google_domains(user.role))
                             }
                         }
                         resp = jsonify(response_data)
@@ -615,7 +634,7 @@ class UserAPI:
             
             # If request includes a UID parameter and user is admin, get that user's grade data
             uid = request.args.get('uid')
-            if current_user.role == 'Admin' and uid:
+            if current_user.is_admin() and uid:
                 user = User.query.filter_by(_uid=uid).first()
                 if not user:
                     return {'message': f'User {uid} not found'}, 404
@@ -634,13 +653,13 @@ class UserAPI:
             
             # Determine which user's grade data to update
             uid = body.get('uid')
-            if current_user.role == 'Admin' and uid:
+            if current_user.is_admin() and uid:
                 user = User.query.filter_by(_uid=uid).first()
                 if not user:
                     return {'message': f'User {uid} not found'}, 404
             else:
                 # Non-admins can only update their own grade data
-                if uid and uid != current_user.uid and current_user.role != 'Admin':
+                if uid and uid != current_user.uid and not current_user.is_admin():
                     return {'message': 'Permission denied: You can only update your own grade data'}, 403
                 user = current_user
             
@@ -668,7 +687,7 @@ class UserAPI:
             
             # If request includes a UID parameter and user is admin, get that user's AP exam data
             uid = request.args.get('uid')
-            if current_user.role == 'Admin' and uid:
+            if current_user.is_admin() and uid:
                 user = User.query.filter_by(_uid=uid).first()
                 if not user:
                     return {'message': f'User {uid} not found'}, 404
@@ -687,13 +706,13 @@ class UserAPI:
             
             # Determine which user's AP exam data to update
             uid = body.get('uid')
-            if current_user.role == 'Admin' and uid:
+            if current_user.is_admin() and uid:
                 user = User.query.filter_by(_uid=uid).first()
                 if not user:
                     return {'message': f'User {uid} not found'}, 404
             else:
                 # Non-admins can only update their own AP exam data
-                if uid and uid != current_user.uid and current_user.role != 'Admin':
+                if uid and uid != current_user.uid and not current_user.is_admin():
                     return {'message': 'Permission denied: You can only update your own AP exam data'}, 403
                 user = current_user
             
@@ -721,7 +740,7 @@ class UserAPI:
 
             # If request includes a UID parameter and user is admin, get that user's school data
             uid = request.args.get('uid')
-            if current_user.role == 'Admin' and uid:
+            if current_user.is_admin() and uid:
                 user = User.query.filter_by(_uid=uid).first()
                 if not user:
                     return {'message': f'User {uid} not found'}, 404
@@ -740,13 +759,13 @@ class UserAPI:
 
             # Determine which user's school data to update
             uid = body.get('uid')
-            if current_user.role == 'Admin' and uid:
+            if current_user.is_admin() and uid:
                 user = User.query.filter_by(_uid=uid).first()
                 if not user:
                     return {'message': f'User {uid} not found'}, 404
             else:
                 # Non-admins can only update their own school data
-                if uid and uid != current_user.uid and current_user.role != 'Admin':
+                if uid and uid != current_user.uid and not current_user.is_admin():
                     return {'message': 'Permission denied: You can only update your own school data'}, 403
                 user = current_user
 
@@ -783,10 +802,8 @@ class UserAPI:
             if uid is None or len(uid) < 2:
                 return {'message': 'Username is missing, or is less than 2 characters'}, 400
 
-            # Validate password (relaxed requirement for guests)
+            # Guests follow the same password rule as everyone else (checked in the model)
             password = body.get('password')
-            if password is None or len(password) < 2:
-                return {'message': 'Password is missing, or is less than 2 characters'}, 400
 
             # Auto-generate required fields for guest accounts
             name = f"Guest_{uid}"
@@ -846,8 +863,9 @@ class UserAPI:
 
             if not uid or not reset_token or not password:
                 return {'message': 'uid, resetToken, and newPassword are required'}, 400
-            if len(password) < 8:
-                return {'message': 'Password must be at least 8 characters'}, 400
+            # Check the rule before the single-use token gets spent on a weak password
+            if not meets_password_rule(password):
+                raise WeakPasswordError()
             if not _consume_reset_token(uid, reset_token):
                 return {'message': 'Invalid, expired, or already-used reset token'}, 403
 
@@ -866,7 +884,7 @@ class UserAPI:
         How long that covers is fixed for some roles (see model/account_types.json); for the
         others the optional JSON body {"days": N} says (1 up to the full interval), and
         default_verification_days applies when it is left out."""
-        @token_required(["Teacher", "Admin"])
+        @token_required(account_types.staff_roles())
         def post(self, uid):
             target = User.query.filter_by(_uid=uid).first()
             if target is None:
@@ -884,7 +902,7 @@ class UserAPI:
 
     class _DeactivateAccount(Resource):
         """Teacher/Admin marks an account inactive. The account and its data are kept."""
-        @token_required(["Teacher", "Admin"])
+        @token_required(account_types.staff_roles())
         def post(self, uid):
             target = User.query.filter_by(_uid=uid).first()
             if target is None:
@@ -895,9 +913,9 @@ class UserAPI:
             return jsonify(_without_password(target.deactivate().read()))
 
     class _ChangeRole(Resource):
-        """Teacher/Admin changes another account's role: POST {"role": "Mentor"}. Only an Admin can
+        """Teacher/Admin changes another account's role: POST {"role": <a role from account_types.json>}. Only an Admin can
         make someone an Admin or change an Admin's role; nobody changes their own role."""
-        @token_required(["Teacher", "Admin"])
+        @token_required(account_types.staff_roles())
         def post(self, uid):
             target = User.query.filter_by(_uid=uid).first()
             if target is None:
@@ -911,11 +929,29 @@ class UserAPI:
             db.session.commit()
             return jsonify(_without_password(target.read()))
 
+    class _Reverify(Resource):
+        """A student whose verification has lapsed verifies again with school Google sign-in:
+        POST {"idToken": ...}. Every other account is verified by a Teacher or Admin."""
+        @token_required()
+        def post(self):
+            user = g.current_user
+            domains = account_types.google_domains(user.role)
+            if not domains:
+                return {'message': 'A Teacher or Admin verifies this account'}, 403
+            if user.verification_state != "active_verification_required":
+                return {'message': 'No verification is due'}, 409
+            body = request.get_json(silent=True)
+            if not isinstance(body, dict):
+                return {'message': 'The body must be a JSON object such as {"idToken": "..."}'}, 400
+            if not verified_google_email(body.get('idToken'), domains):
+                return {'message': 'Google could not verify a school account from this sign-in'}, 403
+            return jsonify(_without_password(user.activate().read()))
+
     class _AdminCreate(Resource):
         """Teacher/Admin creates an account of a staff-created type (see
         model/account_types.json). The account starts inactive and follows the same
         verification step as a self-created one."""
-        @token_required(["Teacher", "Admin"])
+        @token_required(account_types.staff_roles())
         def post(self):
             body = request.get_json(silent=True) or {}
             allowed = account_types.staff_created()
@@ -923,8 +959,8 @@ class UserAPI:
             name, uid, password = body.get('name'), body.get('uid'), body.get('password')
             if role is None:
                 return {'message': f"accountType must be one of: {', '.join(allowed)}"}, 400
-            if not name or not uid or not password or len(password) < 8:
-                return {'message': 'name, uid and a password of at least 8 characters are required'}, 400
+            if not name or not uid or not password:
+                return {'message': 'name, uid and password are required'}, 400
             user = User(name=name, uid=uid, password=password, role=role).create(
                 {'email': body['email']} if body.get('email') else None)
             if not user:
@@ -945,6 +981,7 @@ class UserAPI:
     api.add_resource(_VerifyAccount, '/user/<string:uid>/verify')
     api.add_resource(_DeactivateAccount, '/user/<string:uid>/deactivate')
     api.add_resource(_ChangeRole, '/user/<string:uid>/role')
+    api.add_resource(_Reverify, '/user/reverify')
     api.add_resource(_AdminCreate, '/user/admin-create')
     
     class _Class(Resource):
@@ -958,7 +995,7 @@ class UserAPI:
         def get(self):
             current_user = g.current_user
             uid = request.args.get('uid')
-            if current_user.role == 'Admin' and uid:
+            if current_user.is_admin() and uid:
                 user = User.query.filter_by(_uid=uid).first()
                 if not user:
                     return {'message': f'User {uid} not found'}, 404
@@ -973,7 +1010,7 @@ class UserAPI:
             current_user = g.current_user
             body = request.get_json() or {}
             uid = body.get('uid')
-            if current_user.role == 'Admin' and uid:
+            if current_user.is_admin() and uid:
                 user = User.query.filter_by(_uid=uid).first()
                 if not user:
                     return {'message': f'User {uid} not found'}, 404
@@ -1017,7 +1054,7 @@ class UserAPI:
             current_user = g.current_user
             body = request.get_json() or {}
             uid = body.get('uid')
-            if current_user.role == 'Admin' and uid:
+            if current_user.is_admin() and uid:
                 user = User.query.filter_by(_uid=uid).first()
                 if not user:
                     return {'message': f'User {uid} not found'}, 404

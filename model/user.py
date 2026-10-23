@@ -4,12 +4,35 @@ from flask_login import UserMixin
 from datetime import date, datetime, timedelta
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.exceptions import BadRequest
 import os
 import json
+import re
 
 from __init__ import app, db
 from model import account_types
 from model.github import GitHubUser
+
+""" Password Rule """
+
+# The one password rule for every account. Same as Spring's Person.checkPassword()
+# and pages' assets/js/api/passwordRules.js: 8+ characters with an uppercase letter,
+# a lowercase letter, a number, and one of ` ~ ! @ # $ % ^ & * ( )
+PASSWORD_RULE = 'Password needs 8+ characters with an uppercase letter, a lowercase letter, a number, and one of ` ~ ! @ # $ % ^ & * ( )'
+_PASSWORD_CHECKS = (r'[A-Z]', r'[a-z]', r'[0-9]', r'[`~!@#$%^&*()]')
+
+
+class WeakPasswordError(BadRequest):
+    """Raised by the model when a new password breaks the rule. It is a 400, so the
+    API sends back {"message": PASSWORD_RULE} without any route handling it."""
+    description = PASSWORD_RULE
+
+
+def meets_password_rule(password):
+    """True when a plaintext password follows PASSWORD_RULE."""
+    return (isinstance(password, str) and len(password) >= 8
+            and all(re.search(check, password) for check in _PASSWORD_CHECKS))
+
 
 """ Helper Functions """
 
@@ -282,11 +305,14 @@ class User(db.Model, UserMixin):
 
     # set password, this is conventional setter with business logic
     def set_password(self, password):
-        """Set password: hash if not already hashed, else set directly."""
+        """Set password: hash if not already hashed, else set directly.
+        A new plaintext password must follow PASSWORD_RULE or WeakPasswordError is raised."""
         if password and password.startswith("pbkdf2:sha256:"):
-            # Already hashed, set directly
+            # Already hashed (backup restore, bulk import), set directly
             new_hash = password
         else:
+            if not meets_password_rule(password):
+                raise WeakPasswordError()
             # Not hashed, hash it
             new_hash = generate_password_hash(password, "pbkdf2:sha256", salt_length=10)
 
@@ -316,7 +342,7 @@ class User(db.Model, UserMixin):
         self._role = role
 
     def is_admin(self):
-        return self._role == "Admin"
+        return self._role == account_types.admin_role()
 
     def is_teacher(self):
         return self._role == "Teacher"
@@ -371,7 +397,7 @@ class User(db.Model, UserMixin):
 
     def grantable_roles(self):
         """The roles this account may give to another account. Only an Admin may grant Admin."""
-        return tuple(r for r in account_types.assignable_roles() if r != "Admin" or self.is_admin())
+        return tuple(r for r in account_types.assignable_roles() if r != account_types.admin_role() or self.is_admin())
 
     def role_change_blocker(self, actor, new_role):
         """None if actor may set this account's role to new_role, else (HTTP status, reason)."""
@@ -598,6 +624,9 @@ class User(db.Model, UserMixin):
         ap_exam = inputs.get("ap_exam", None)
         class_list = inputs.get("class", None) or inputs.get("_class", None)
         school = inputs.get("school", None)
+        # Password goes first: if the model rejects it, nothing else has changed yet.
+        if password:
+            self.set_password(password)
         # Update table with new data
         if name:
             self.name = name
@@ -607,8 +636,6 @@ class User(db.Model, UserMixin):
             self.email = email
         if sid:
             self.sid = sid
-        if password:
-            self.set_password(password)
         if pfp is not None:
             self.pfp = pfp
         if grade_data is not None:
@@ -847,7 +874,7 @@ def initUsers():
             'last_updated': None
         }
 
-        u1 = User(name=app.config['ADMIN_USER'], uid=app.config['ADMIN_UID'], password=app.config['ADMIN_PASSWORD'], pfp=app.config['ADMIN_PFP'], role="Admin")
+        u1 = User(name=app.config['ADMIN_USER'], uid=app.config['ADMIN_UID'], password=app.config['ADMIN_PASSWORD'], pfp=app.config['ADMIN_PFP'], role=account_types.admin_role())
         u2 = User(name=app.config['USER_NAME'], uid=app.config['USER_UID'], password=app.config['USER_PASSWORD'], pfp=app.config['USER_PFP'])
         u3 = User(name=app.config['TEACHER_USER'], uid=app.config['TEACHER_UID'], pfp=app.config['TEACHER_PFP'], password=app.config['TEACHER_PASSWORD'], role='Teacher')
         u4 = User(name=app.config['MY_NAME'], uid=app.config['MY_UID'], pfp=app.config['MY_PFP'], password=app.config['MY_PASSWORD'], role=app.config['MY_ROLE'])
