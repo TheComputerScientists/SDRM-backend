@@ -1,20 +1,25 @@
 """ Data for the SDRM volunteer site that has to be shared between users: volunteer
-shifts and the sign-ups for them (spots left are counted across everyone).
+shifts and the sign-ups for them (spots left are counted across everyone), and the help
+resources (meals, shelter, programs) that coordinators keep up to date.
 
-Page text and the other placeholder data (help resources, gift rates, home stats) are
+Resources are public program information only -- never anything about the people the
+Mission serves. Page text and the other placeholder data (gift rates, home stats) are
 static files in the frontend (assets/data/sdrm/*.json), not database tables.
 init_sdrm() creates the tables if they're missing and fills empty ones with the
 placeholder rows below (all marked "TODO: verify", none of them real figures).
 """
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Table, Text, UniqueConstraint
 from sqlalchemy.orm import backref, relationship
 
 from __init__ import app, db
 from model.user import User
 
 DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+# Longest value each resource field may hold (checked by the API before saving)
+RESOURCE_MAX = {'name': 200, 'description': 1000, 'address': 200, 'hours': 100, 'phone': 40}
 
 
 """ Volunteer """
@@ -72,7 +77,69 @@ class SdrmSignup(db.Model):
     user = relationship(User, backref=backref('sdrm_signups', cascade='all, delete-orphan'))
 
 
-SDRM_TABLES = [SdrmInterest.__table__, SdrmOpportunity.__table__, SdrmSignup.__table__]
+""" Help resources """
+
+class SdrmNeed(db.Model):
+    """A kind of help, e.g. "meals" / "Meals"."""
+    __tablename__ = 'sdrm_needs'
+
+    id = Column(String(32), primary_key=True)
+    label = Column(String(100), nullable=False)
+    position = Column(Integer, nullable=False, default=0)
+
+    def read(self):
+        return {'id': self.id, 'label': self.label}
+
+
+class SdrmLocation(db.Model):
+    """An area of the county, e.g. "downtown" / "Downtown San Diego"."""
+    __tablename__ = 'sdrm_locations'
+
+    id = Column(String(32), primary_key=True)
+    label = Column(String(100), nullable=False)
+    position = Column(Integer, nullable=False, default=0)
+
+    def read(self):
+        return {'id': self.id, 'label': self.label}
+
+
+sdrm_resource_needs = Table(
+    'sdrm_resource_needs', db.metadata,
+    Column('resource_id', String(32), ForeignKey('sdrm_resources.id'), primary_key=True),
+    Column('need_id', String(32), ForeignKey('sdrm_needs.id'), primary_key=True),
+)
+
+
+class SdrmResource(db.Model):
+    """A public program or service (shelter, meals, ...). Same shape as a resources.json entry."""
+    __tablename__ = 'sdrm_resources'
+
+    id = Column(String(32), primary_key=True)
+    name = Column(String(RESOURCE_MAX['name']), nullable=False)
+    location_id = Column(String(32), ForeignKey('sdrm_locations.id'), nullable=False)
+    description = Column(Text, nullable=False, default='')
+    address = Column(String(RESOURCE_MAX['address']), nullable=False, default='')
+    hours = Column(String(RESOURCE_MAX['hours']), nullable=False, default='')
+    phone = Column(String(RESOURCE_MAX['phone']), nullable=False, default='')
+    position = Column(Integer, nullable=False, default=0)
+
+    needs = relationship(SdrmNeed, secondary=sdrm_resource_needs, order_by=SdrmNeed.position)
+
+    def read(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'needs': [n.id for n in self.needs],
+            'location': self.location_id,
+            'description': self.description,
+            'address': self.address,
+            'hours': self.hours,
+            'phone': self.phone,
+        }
+
+
+SDRM_TABLES = [SdrmInterest.__table__, SdrmOpportunity.__table__, SdrmSignup.__table__,
+               SdrmNeed.__table__, SdrmLocation.__table__, SdrmResource.__table__, sdrm_resource_needs]
 
 
 """ Placeholder data (TODO: verify) -- NOT real San Diego Rescue Mission information """
@@ -94,6 +161,22 @@ SEED_OPPORTUNITIES = [
     ("o8", "Story time for kids", "Sunday", "tutoring", 3, "Read aloud and lead a short craft with young children."),
 ]
 
+# The frontend lists these same resources from assets/data/sdrm/resources.json when this
+# server can't be reached, so keep the two in step. Address, hours and phone stay TODO.
+SEED_NEEDS = [("shelter", "Shelter"), ("meals", "Meals"), ("family", "Family services"), ("recovery", "Recovery")]
+
+SEED_LOCATIONS = [("downtown", "Downtown San Diego"), ("north", "North County"), ("east", "East County"), ("south", "South Bay")]
+
+SEED_RESOURCES = [
+    ("r1", "Emergency Overnight Shelter", ["shelter", "meals"], "downtown", "A safe bed for the night, a shower, and a hot dinner for adults experiencing homelessness."),
+    ("r2", "Community Meal Hall", ["meals"], "downtown", "Free walk-in meals served daily. No sign-up or ID needed."),
+    ("r3", "Family Housing Program", ["shelter", "family"], "downtown", "Short-term housing for parents with children, plus help finding a longer-term home."),
+    ("r4", "Residential Recovery Program", ["recovery", "shelter"], "downtown", "A structured, live-in program with counseling, life skills classes, and job readiness support."),
+    ("r5", "Kids and Parents Resource Day", ["family", "meals"], "south", "Weekly drop-in with school supplies, a family lunch, and referrals to child care and health services."),
+    ("r6", "Recovery Support Group", ["recovery"], "north", "Peer-led evening support meetings for people in or considering recovery."),
+    ("r7", "Mobile Meal Outreach", ["meals"], "east", "A meal van that brings food and water to neighbors who cannot travel downtown."),
+]
+
 
 def init_sdrm():
     """Create any missing SDRM tables and seed the empty ones. Safe to run on every start; never overwrites rows."""
@@ -108,5 +191,17 @@ def init_sdrm():
             db.session.add_all(SdrmOpportunity(id=i, title=title, day=day, interest_id=interest, time=TODO,
                                                capacity=capacity, description=description, position=n)
                                for n, (i, title, day, interest, capacity, description) in enumerate(SEED_OPPORTUNITIES))
+
+        if not SdrmNeed.query.first():
+            db.session.add_all(SdrmNeed(id=i, label=label, position=n) for n, (i, label) in enumerate(SEED_NEEDS))
+        if not SdrmLocation.query.first():
+            db.session.add_all(SdrmLocation(id=i, label=label, position=n) for n, (i, label) in enumerate(SEED_LOCATIONS))
+        db.session.flush()
+
+        if not SdrmResource.query.first():
+            needs = {n.id: n for n in SdrmNeed.query}
+            db.session.add_all(SdrmResource(id=i, name=name, needs=[needs[x] for x in need_ids], location_id=location,
+                                            description=description, address=TODO, hours=TODO, phone=TODO, position=n)
+                               for n, (i, name, need_ids, location, description) in enumerate(SEED_RESOURCES))
 
         db.session.commit()

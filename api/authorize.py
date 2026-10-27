@@ -145,3 +145,44 @@ def token_required(roles=None):
     Existing code using @token_required will continue to work.
     '''
     return auth_required(roles)
+
+
+def optional_user():
+    '''
+    The logged-in user, or None for a visitor (or a bad/expired token). Never errors.
+
+    For public endpoints that show a little more to signed-in users (session first, then the
+    JWT cookie or Bearer header, like auth_required).
+    '''
+    if current_user.is_authenticated:
+        return current_user
+
+    token = request.cookies.get(current_app.config.get("JWT_TOKEN_NAME"))
+    if not token:
+        auth_header = request.headers.get('Authorization', request.headers.get('authorization', '')) or ''
+        token = auth_header.split(' ', 1)[1].strip() if auth_header.startswith('Bearer ') else auth_header.strip()
+    if not token:
+        return None
+
+    try:
+        data = jwt.decode(token, current_app.config["SECRET_KEY"], algorithms=["HS256"])
+    except Exception:
+        return None
+    user = User.query.filter_by(_uid=data.get("_uid")).first()
+    if user is None or data.get("token_version", 0) != (user.token_version or 0) or not user.active:
+        return None
+    return user
+
+
+def role_required(*roles):
+    '''
+    Allow only users with one of these SDRM roles, e.g. @role_required("coordinator", "admin").
+
+    Role names are matched without regard to letter case ("coordinator" -> "Coordinator", the
+    spelling stored on users). Built on auth_required, so it returns
+      401 / Unauthorized when not logged in, and
+      403 / Forbidden when logged in with a role that isn't listed.
+    '''
+    if not roles or not all(isinstance(role, str) and role.strip() for role in roles):
+        raise ValueError(f"role_required: unknown role in {roles}")
+    return auth_required(tuple(role.strip().capitalize() for role in roles))

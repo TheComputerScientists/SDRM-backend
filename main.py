@@ -35,6 +35,8 @@ from api.profile_game import profile_game_api  # CS Pathway Game profile persist
 from api.snapshot_proxy import snapshot_proxy
 from api.rfid_api import rfid_api
 from api.presence_api import presence_api
+from api.coordinator import coordinator_api  # SDRM coordinator-only routes
+from api.sdrm import sdrm_api  # SDRM volunteer shifts and help resources
 #from api.announcement import announcement_api ##temporary revert
 
 # database Initialization functions
@@ -53,6 +55,7 @@ from model.post import Post, init_posts
 from model.microblog import MicroBlog, Topic, initMicroblogs
 from model.leaderboard import ScoreCounterEvent, ElementaryLeaderboardEvent
 from hacks.jokes import initJokes 
+from model.sdrm import init_sdrm
 # from model.announcement import Announcement ##temporary revert
 
 # server only Views
@@ -93,11 +96,16 @@ app.register_blueprint(profile_game_api)  # CS Pathway Game profile persistence
 app.register_blueprint(snapshot_proxy)  # Register the snapshot proxy API
 app.register_blueprint(rfid_api)  # Register the RFID attendance API
 app.register_blueprint(presence_api)  # Register the generic presence event API
+app.register_blueprint(coordinator_api)  # SDRM coordinator-only routes
+app.register_blueprint(sdrm_api)  # SDRM volunteer shifts and help resources
 # app.register_blueprint(announcement_api) ##temporary revert
 
 # Jokes file initialization
 with app.app_context():
     initJokes()
+
+# Create and seed the SDRM site data tables if they're missing (keeps existing rows)
+init_sdrm()
 
 # Tell Flask-Login the view function name of your login route
 login_manager.login_view = "login"
