@@ -1,6 +1,7 @@
 """ Data for the SDRM volunteer site that has to be shared between users: volunteer
-shifts and the sign-ups for them (spots left are counted across everyone), and the help
-resources (meals, shelter, programs) that coordinators keep up to date.
+shifts, the sign-ups for them (spots left are counted across everyone) and the service
+hours logged on them, and the help resources (meals, shelter, programs) that coordinators
+keep up to date.
 
 Resources are public program information only -- never anything about the people the
 Mission serves. Page text and the other placeholder data (gift rates, home stats) are
@@ -10,7 +11,7 @@ placeholder rows below (all marked "TODO: verify", none of them real figures).
 """
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Table, Text, UniqueConstraint
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Table, Text, UniqueConstraint, inspect, text
 from sqlalchemy.orm import backref, relationship
 
 from __init__ import app, db
@@ -20,6 +21,18 @@ DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sun
 
 # Longest value each resource field may hold (checked by the API before saving)
 RESOURCE_MAX = {'name': 200, 'description': 1000, 'address': 200, 'hours': 100, 'phone': 40}
+
+# Longest value each shift field may hold, and the largest capacity (checked by the API)
+OPPORTUNITY_MAX = {'title': 200, 'time': 100, 'description': 1000}
+CAPACITY_MAX = 500
+
+# A sign-up can hold spots for a small group (e.g. a student club), not just one person
+GROUP_SIZE_MIN, GROUP_SIZE_MAX = 1, 10
+
+# Service hours per log: a quarter hour up to a 12-hour day, in quarter-hour steps
+HOURS_MIN, HOURS_MAX, HOURS_STEP = 0.25, 12, 0.25
+HOURS_NOTE_MAX = 300
+HOURS_STATUSES = ('pending', 'approved', 'rejected')
 
 
 """ Volunteer """
@@ -37,7 +50,7 @@ class SdrmInterest(db.Model):
 
 
 class SdrmOpportunity(db.Model):
-    """A volunteer shift. `capacity` is how many people it takes; spots left = capacity - sign-ups."""
+    """A volunteer shift. `capacity` is how many people it takes; spots left = capacity - the group sizes signed up."""
     __tablename__ = 'sdrm_opportunities'
 
     id = Column(String(32), primary_key=True)
@@ -49,8 +62,8 @@ class SdrmOpportunity(db.Model):
     description = Column(Text, nullable=False, default='')
     position = Column(Integer, nullable=False, default=0)
 
-    def read(self, taken, signed_up):
-        """Public fields plus spots left, given how many spots are `taken` and whether the viewer holds one."""
+    def read(self, taken, signup):
+        """Public fields plus spots left, given how many spots are `taken` and the viewer's SdrmSignup (or None)."""
         return {
             'id': self.id,
             'title': self.title,
@@ -58,23 +71,64 @@ class SdrmOpportunity(db.Model):
             'interest': self.interest_id,
             'time': self.time,
             'description': self.description,
+            'capacity': self.capacity,
             'spots': max(0, self.capacity - taken),
-            'signedUp': signed_up,
+            'signedUp': signup is not None,
+            'groupSize': signup.group_size if signup is not None else None,
         }
 
 
 class SdrmSignup(db.Model):
-    """One user holding one spot on one shift."""
+    """One user holding `group_size` spots on one shift (themselves plus the rest of their group)."""
     __tablename__ = 'sdrm_signups'
     __table_args__ = (UniqueConstraint('opportunity_id', 'user_id', name='uq_sdrm_signup'),)
 
     id = Column(Integer, primary_key=True)
     opportunity_id = Column(String(32), ForeignKey('sdrm_opportunities.id'), nullable=False)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    group_size = Column(Integer, nullable=False, default=1)
     created = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     # Deleting a user frees their spots
     user = relationship(User, backref=backref('sdrm_signups', cascade='all, delete-orphan'))
+
+
+class SdrmHoursLog(db.Model):
+    """Service hours a volunteer logged on a shift they signed up for. A coordinator approves or rejects it."""
+    __tablename__ = 'sdrm_hours_logs'
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    opportunity_id = Column(String(32), ForeignKey('sdrm_opportunities.id'), nullable=False)
+    hours = Column(Float, nullable=False)
+    note = Column(String(HOURS_NOTE_MAX), nullable=False, default='')
+    status = Column(String(10), nullable=False, default='pending')
+    created = Column(DateTime, nullable=False, default=datetime.utcnow)
+    reviewed_by = Column(Integer, ForeignKey('users.id'), nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+
+    # Deleting a user removes the hours they logged
+    user = relationship(User, foreign_keys=[user_id], backref=backref('sdrm_hours_logs', cascade='all, delete-orphan'))
+    reviewer = relationship(User, foreign_keys=[reviewed_by])
+    opportunity = relationship(SdrmOpportunity)
+
+    def read(self):
+        return {
+            'id': self.id,
+            'opportunity': self.opportunity_id,
+            'shift': self.opportunity.title if self.opportunity else self.opportunity_id,
+            'day': self.opportunity.day if self.opportunity else '',
+            'hours': self.hours,
+            'note': self.note,
+            'status': self.status,
+            'created': self.created.isoformat(),
+            'reviewedAt': self.reviewed_at.isoformat() if self.reviewed_at else None,
+        }
+
+    def read_for_review(self):
+        """read() plus who logged it, for coordinators."""
+        return {**self.read(), 'volunteer': self.user.name if self.user else None,
+                'uid': self.user.uid if self.user else None}
 
 
 """ Help resources """
@@ -138,7 +192,7 @@ class SdrmResource(db.Model):
         }
 
 
-SDRM_TABLES = [SdrmInterest.__table__, SdrmOpportunity.__table__, SdrmSignup.__table__,
+SDRM_TABLES = [SdrmInterest.__table__, SdrmOpportunity.__table__, SdrmSignup.__table__, SdrmHoursLog.__table__,
                SdrmNeed.__table__, SdrmLocation.__table__, SdrmResource.__table__, sdrm_resource_needs]
 
 
@@ -182,6 +236,12 @@ def init_sdrm():
     """Create any missing SDRM tables and seed the empty ones. Safe to run on every start; never overwrites rows."""
     with app.app_context():
         db.metadata.create_all(db.engine, tables=SDRM_TABLES)
+
+        # create_all() doesn't add columns to an existing table. Sign-ups made before
+        # group sign-up (issue #3) become groups of 1.
+        if 'group_size' not in {c['name'] for c in inspect(db.engine).get_columns('sdrm_signups')}:
+            with db.engine.begin() as connection:
+                connection.execute(text('ALTER TABLE sdrm_signups ADD COLUMN group_size INTEGER NOT NULL DEFAULT 1'))
 
         if not SdrmInterest.query.first():
             db.session.add_all(SdrmInterest(id=i, label=label, position=n) for n, (i, label) in enumerate(SEED_INTERESTS))

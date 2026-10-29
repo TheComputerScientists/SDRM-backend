@@ -2,6 +2,7 @@
 from flask import current_app
 from flask_login import UserMixin
 from datetime import date, datetime, timedelta
+from sqlalchemy import func, inspect, text
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.exceptions import BadRequest
@@ -32,6 +33,18 @@ def meets_password_rule(password):
     """True when a plaintext password follows PASSWORD_RULE."""
     return (isinstance(password, str) and len(password) >= 8
             and all(re.search(check, password) for check in _PASSWORD_CHECKS))
+
+
+""" Volunteer Sign-up """
+
+# SDRM sign-ups use an email address as the login name. Same check as the frontend's
+# EMAIL_PATTERN in assets/js/sdrm/auth.js.
+EMAIL_PATTERN = re.compile(r'[^\s@]+@[^\s@]+\.[^\s@]+')
+# Every self sign-up starts as a Volunteer; a Coordinator or Admin is made by changing the role.
+VOLUNTEER_ROLE = "Volunteer"
+# Guardian contact for volunteers under 18 (optional). Same limits as auth.js.
+GUARDIAN_NAME_MAX = 100
+GUARDIAN_EMAIL_MAX = 254
 
 
 """ Helper Functions """
@@ -179,6 +192,9 @@ class User(db.Model, UserMixin):
     _class = db.Column(db.JSON, unique=False, nullable=True)
     _school = db.Column(db.String(255), default="Unknown", nullable=True)
     _game_profile = db.Column(db.JSON, unique=False, nullable=True)
+    # An existing database gets these from migrate_guardian_columns() (scripts/db_add_guardian_columns.py)
+    _guardian_name = db.Column(db.String(GUARDIAN_NAME_MAX), nullable=True)
+    _guardian_email = db.Column(db.String(GUARDIAN_EMAIL_MAX), nullable=True)
     # Bumped every time the password actually changes (set_password). Embedded in issued
     # JWTs and in the Flask-Login session id (see get_id) and checked on every request, so
     # a stolen JWT or session cookie stops working the moment this account's password is
@@ -264,6 +280,29 @@ class User(db.Model, UserMixin):
             pass
         else:
             self.email = "?"
+
+    @classmethod
+    def find_by_email(cls, email):
+        """The user with this email address (any letter case), or None. Never matches the "?" placeholder."""
+        if not isinstance(email, str) or not EMAIL_PATTERN.fullmatch(email.strip()):
+            return None
+        return cls.query.filter(func.lower(cls._email) == email.strip().lower()).first()
+
+    @property
+    def guardian_name(self):
+        return self._guardian_name
+
+    @guardian_name.setter
+    def guardian_name(self, guardian_name):
+        self._guardian_name = guardian_name or None
+
+    @property
+    def guardian_email(self):
+        return self._guardian_email
+
+    @guardian_email.setter
+    def guardian_email(self, guardian_email):
+        self._guardian_email = guardian_email or None
 
     # a name getter method, extracts name from object
     @property
@@ -601,6 +640,8 @@ class User(db.Model, UserMixin):
             "active": self.active,
             "last_verified": self.last_verified.isoformat() if self.last_verified else None,
             "verification_state": self.verification_state,
+            "guardian_name": self.guardian_name,
+            "guardian_email": self.guardian_email,
         }
         sections = self.read_sections()
         data.update(sections)
@@ -653,6 +694,11 @@ class User(db.Model, UserMixin):
         game_profile = inputs.get("game_profile", None)
         if game_profile is not None:
             self.game_profile = game_profile
+        # Guardian fields: "" or None clears them, a missing key leaves them alone
+        if "guardian_name" in inputs:
+            self.guardian_name = inputs["guardian_name"]
+        if "guardian_email" in inputs:
+            self.guardian_email = inputs["guardian_email"]
 
         # Check this on each update
         if not email:
@@ -829,6 +875,29 @@ class User(db.Model, UserMixin):
             new_path = os.path.join(current_app.config['UPLOAD_FOLDER'], self._uid)
             if os.path.exists(old_path):
                 os.rename(old_path, new_path)
+
+"""Database Migration """
+
+def migrate_guardian_columns():
+    """Add users._guardian_name and users._guardian_email to an existing database if they are
+    missing. Only adds columns, never drops or changes data, so it is safe to run again.
+    Returns the names of the columns it added."""
+    with app.app_context():
+        inspector = inspect(db.engine)
+        if 'users' not in inspector.get_table_names():
+            return []  # fresh database: db.create_all() builds the columns itself
+        existing = {column['name'] for column in inspector.get_columns('users')}
+        new_columns = {
+            '_guardian_name': f'VARCHAR({GUARDIAN_NAME_MAX})',
+            '_guardian_email': f'VARCHAR({GUARDIAN_EMAIL_MAX})',
+        }
+        added = []
+        with db.engine.begin() as conn:
+            for name, sql_type in new_columns.items():
+                if name not in existing:
+                    conn.execute(text(f'ALTER TABLE users ADD COLUMN {name} {sql_type} NULL'))
+                    added.append(name)
+        return added
 
 """Database Creation and Testing """
 

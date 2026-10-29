@@ -8,11 +8,13 @@ from flask_restful import Api, Resource # used for REST API building
 from datetime import datetime, timedelta
 from __init__ import app, db
 from api.authorize import token_required
-from model.user import User, meets_password_rule, WeakPasswordError
+from model.user import (User, meets_password_rule, WeakPasswordError, EMAIL_PATTERN, VOLUNTEER_ROLE,
+                        GUARDIAN_NAME_MAX, GUARDIAN_EMAIL_MAX)
 from model import account_types
 from model.google_token import verified_google_email
 from model.github import GitHubUser
 import os
+import re
 
 user_api = Blueprint('user_api', __name__,
                    url_prefix='/api')
@@ -96,6 +98,88 @@ def _staff_caller():
     return caller if isinstance(caller, User) else None
 
 
+def _guardian_fields(body, user=None):
+    """Check the optional guardian_name / guardian_email in a request body.
+
+    Returns (fields, error_message). fields holds only the keys that were sent, trimmed,
+    with "" meaning "clear it". Name and email go together: after the change the user has
+    both or neither (user is the account being updated, None on sign-up). Messages start
+    with "Guardian name" / "Guardian email" because the frontend (auth.js) matches on that.
+    """
+    fields = {}
+    for key, label in (('guardian_name', 'Guardian name'), ('guardian_email', 'Guardian email')):
+        if key not in body:
+            continue
+        value = body.get(key)
+        if value is None:
+            value = ''
+        if not isinstance(value, str):
+            return None, f'{label} must be text'
+        fields[key] = value.strip()
+    if 'guardian_email' in fields:
+        fields['guardian_email'] = fields['guardian_email'].lower()
+
+    name = fields.get('guardian_name', user.guardian_name if user else None) or ''
+    email = fields.get('guardian_email', user.guardian_email if user else None) or ''
+    if name and not 2 <= len(name) <= GUARDIAN_NAME_MAX:
+        return None, f'Guardian name must be 2 to {GUARDIAN_NAME_MAX} characters'
+    if email and (len(email) > GUARDIAN_EMAIL_MAX or not EMAIL_PATTERN.fullmatch(email)):
+        return None, 'Guardian email is not a valid email address'
+    if name and not email:
+        return None, 'Guardian email is required when a guardian name is given'
+    if email and not name:
+        return None, 'Guardian name is required when a guardian email is given'
+    return fields, None
+
+
+def _uid_from_email(email):
+    """A unique internal User ID made from the part of the email before the @
+    ("Jane.Doe+sdrm@x.org" -> "jane.doe-sdrm", then "jane.doe-sdrm-2", ...)."""
+    base = re.sub(r'[^a-z0-9._-]+', '-', email.split('@', 1)[0].lower()).strip('.-_')[:30]
+    if len(base) < 2:
+        base = 'volunteer'
+    uid, n = base, 1
+    while User.query.filter_by(_uid=uid).first() is not None:
+        n += 1
+        uid = f'{base}-{n}'
+    return uid
+
+
+def _email_signup(body):
+    """POST /api/user without a uid: SDRM volunteer sign-up with name, email and password
+    (plus optional guardian contact). Error messages start with the field name ("Name ...",
+    "Email ...", "Password ...") because the frontend (auth.js) matches on that."""
+    name = body.get('name')
+    name = name.strip() if isinstance(name, str) else ''
+    if len(name) < 2:
+        return {'message': 'Name is missing, or is less than 2 characters'}, 400
+
+    email = body.get('email')
+    email = email.strip().lower() if isinstance(email, str) else ''
+    if len(email) > 255 or not EMAIL_PATTERN.fullmatch(email):
+        return {'message': 'Email is missing, or is not a valid email address'}, 400
+
+    password = body.get('password')
+    if not isinstance(password, str) or len(password) < 8:
+        return {'message': 'Password is missing, or is less than 8 characters'}, 400
+
+    guardian, error = _guardian_fields(body)
+    if error:
+        return {'message': error}, 400
+
+    if User.find_by_email(email) is not None:
+        return {'message': 'Email already registered'}, 409
+
+    # The model also applies the shared PASSWORD_RULE (WeakPasswordError -> 400)
+    user = User(name=name, uid=_uid_from_email(email), password=password, role=VOLUNTEER_ROLE)
+    user = user.create({'email': email, **{k: v for k, v in guardian.items() if v}})
+    if not user:
+        return {'message': 'Could not create the account, please try again'}, 500
+    # Volunteers can use the site right away; a Coordinator/Admin can deactivate an account later
+    user.activate()
+    return jsonify(_without_password(user.read()))
+
+
 def _without_password(user_data):
     """Strip the password hash before a user dict goes out over a general-purpose
     API response. The admin-only backup/export endpoints in data_export_import_api.py
@@ -170,11 +254,17 @@ class UserAPI:
             """
             
             # Read data for json body
-            body = request.get_json()
-            
+            body = request.get_json(silent=True)
+            if not isinstance(body, dict):
+                return {'message': 'Expected a JSON object with name, email and password'}, 400
+
+            # SDRM sign-up sends no uid: email + password, no GitHub check
+            if body.get('uid') is None:
+                return _email_signup(body)
+
             # Debug logging
             #print(f"Received signup request with body: {body}")
-            
+
             ''' Avoid garbage in, error checking '''
             # validate name
             name = body.get('name')
@@ -307,9 +397,12 @@ class UserAPI:
                 user_data = _without_password(user.read())
                 # Add access control
                 if current_user.is_admin() or current_user.id == user.id:
-                    user_data['access'] = ['rw'] # read-write access control 
+                    user_data['access'] = ['rw'] # read-write access control
                 else:
-                    user_data['access'] = ['ro'] # read-only access control 
+                    user_data['access'] = ['ro'] # read-only access control
+                    # A minor's guardian contact is only for the user themselves and admins
+                    user_data.pop('guardian_name', None)
+                    user_data.pop('guardian_email', None)
                 json_ready.append(user_data)
             
             # return response, a list of user dictionaries in JSON format
@@ -363,7 +456,13 @@ class UserAPI:
                 _, status = GitHubUser().get(body.get('uid'))
                 if status != 200:
                     return {'message': f'User ID {body.get("uid")} not a valid GitHub account' }, 404
-            
+
+            # Guardian contact: checked here, saved by user.update(); "" clears it
+            guardian, error = _guardian_fields(body, user)
+            if error:
+                return {'message': error}, 400
+            body.update(guardian)
+
             # Update the User object to the database using custom update method
             user.update(body)
 
@@ -482,20 +581,25 @@ class UserAPI:
                         "error": "Bad request"
                     }, 400
                 ''' Get Data '''
+                # SDRM logs in with an email; the template's uid login still works
+                email = body.get('email')
                 uid = body.get('uid')
-                if uid is None:
-                    return {'message': f'User ID is missing'}, 401
+                if email is None and uid is None:
+                    return {'message': f'Email or User ID is missing'}, 401
                 password = body.get('password')
-                if not password:
+                if not password or not isinstance(password, str):
                     return {'message': f'Password is missing'}, 401
-                            
+
                 ''' Find user '''
-    
-                user = User.query.filter_by(_uid=uid).first()
-                
+
+                if email is not None:
+                    user = User.find_by_email(email)
+                else:
+                    user = User.query.filter_by(_uid=uid).first()
+
                 if user is None or not user.is_password(password):
-                    
-                    return {'message': f"Invalid user id or password"}, 401
+
+                    return {'message': f"Invalid email, user id or password"}, 401
                             
                 # Check if user is found
                 if user:
